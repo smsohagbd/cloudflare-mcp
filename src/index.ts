@@ -1,8 +1,14 @@
 import { handleMCPRequest } from "./mcp/handler";
-import { TOOLS, executeTool } from "./tools";
+import { TOOLS } from "./tools";
 
 export interface Env {
-  // Bindings can be added here (e.g. KV, D1, AI, etc.)
+  DB: D1Database;
+  MEDIA_BUCKET: R2Bucket;
+  AI: any;
+  MCP_API_KEY?: string;
+  LINKEDIN_ACCESS_TOKEN?: string;
+  YOUTUBE_ACCESS_TOKEN?: string;
+  YOUTUBE_API_KEY?: string;
 }
 
 export default {
@@ -21,6 +27,27 @@ export default {
       });
     }
 
+    // Public R2 Media serving endpoint: /media/<key>
+    if (url.pathname.startsWith("/media/")) {
+      if (!env.MEDIA_BUCKET) {
+        return new Response("R2 Storage not configured", { status: 500 });
+      }
+      const key = decodeURIComponent(url.pathname.replace(/^\/media\//, ""));
+      const object = await env.MEDIA_BUCKET.get(key);
+
+      if (!object) {
+        return new Response("File not found in R2 storage", { status: 404 });
+      }
+
+      const headers = new Headers();
+      object.writeHttpMetadata(headers);
+      headers.set("etag", object.httpEtag);
+      headers.set("Access-Control-Allow-Origin", "*");
+      headers.set("Cache-Control", "public, max-age=31536000, immutable");
+
+      return new Response(object.body, { headers });
+    }
+
     // MCP Streamable HTTP JSON-RPC endpoint
     if (url.pathname === "/mcp" || url.pathname === "/api/mcp") {
       return handleMCPRequest(request, env as any);
@@ -32,9 +59,15 @@ export default {
         JSON.stringify({
           status: "healthy",
           server: "cloudflare-mcp",
-          version: "1.0.0",
+          domain: "mcp.sohag.com.bd",
+          version: "2.0.0",
           timestamp: new Date().toISOString(),
           toolsCount: TOOLS.length,
+          bindings: {
+            d1: !!env.DB,
+            r2: !!env.MEDIA_BUCKET,
+            ai: !!env.AI,
+          },
         }),
         {
           status: 200,
@@ -48,7 +81,7 @@ export default {
 
     // Tools discovery endpoint
     if (url.pathname === "/tools" || url.pathname === "/api/tools") {
-      return new Response(JSON.stringify({ tools: TOOLS }, null, 2), {
+      return new Response(JSON.stringify({ count: TOOLS.length, tools: TOOLS }, null, 2), {
         status: 200,
         headers: {
           "Content-Type": "application/json",
@@ -66,7 +99,6 @@ export default {
         start(controller) {
           const enc = new TextEncoder();
           controller.enqueue(enc.encode(`event: endpoint\ndata: ${messageEndpoint}\n\n`));
-          // Keep-alive heartbeat every 15s
           const interval = setInterval(() => {
             try {
               controller.enqueue(enc.encode(`: ping\n\n`));
@@ -97,9 +129,9 @@ export default {
       return handleMCPRequest(request, env as any);
     }
 
-    // Landing Page (GET /)
+    // Landing Dashboard (GET /)
     const cf = (request as any).cf || {};
-    return new Response(renderDashboard(url.origin, cf), {
+    return new Response(renderDashboard(url.origin, cf, env), {
       status: 200,
       headers: {
         "Content-Type": "text/html; charset=utf-8",
@@ -109,7 +141,7 @@ export default {
   },
 };
 
-function renderDashboard(origin: string, cf: any): string {
+function renderDashboard(origin: string, cf: any, env: Env): string {
   const mcpEndpoint = `${origin}/mcp`;
   const sseEndpoint = `${origin}/sse`;
 
@@ -133,18 +165,20 @@ function renderDashboard(origin: string, cf: any): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Cloudflare MCP Server</title>
+  <title>Cloudflare MCP Agent Hub - mcp.sohag.com.bd</title>
   <style>
     :root {
-      --bg: #0f172a;
-      --card: #1e293b;
-      --border: #334155;
+      --bg: #090d16;
+      --card: #131c2e;
+      --card-hover: #1e293b;
+      --border: #26334d;
       --accent: #f38020;
-      --accent-glow: rgba(243, 128, 32, 0.25);
+      --accent-glow: rgba(243, 128, 32, 0.2);
       --text: #f8fafc;
       --text-muted: #94a3b8;
       --green: #22c55e;
       --blue: #38bdf8;
+      --purple: #a855f7;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -152,10 +186,10 @@ function renderDashboard(origin: string, cf: any): string {
       background: var(--bg);
       color: var(--text);
       line-height: 1.6;
-      padding: 2rem 1rem;
+      padding: 2.5rem 1.25rem;
     }
     .container {
-      max-width: 960px;
+      max-width: 1000px;
       margin: 0 auto;
     }
     header {
@@ -185,22 +219,22 @@ function renderDashboard(origin: string, cf: any): string {
       box-shadow: 0 0 8px var(--green);
     }
     h1 {
-      font-size: 2.5rem;
+      font-size: 2.75rem;
       font-weight: 800;
-      background: linear-gradient(135deg, #f38020 0%, #faad3f 100%);
+      background: linear-gradient(135deg, #f38020 0%, #38bdf8 100%);
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
       margin-bottom: 0.5rem;
     }
     p.lead {
       color: var(--text-muted);
-      font-size: 1.1rem;
+      font-size: 1.15rem;
     }
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
       gap: 1.25rem;
-      margin-bottom: 2.5rem;
+      margin-bottom: 2rem;
     }
     .card {
       background: var(--card);
@@ -214,7 +248,7 @@ function renderDashboard(origin: string, cf: any): string {
       color: var(--blue);
     }
     .url-box {
-      background: #090d16;
+      background: #06090e;
       border: 1px solid var(--border);
       border-radius: 8px;
       padding: 0.75rem 1rem;
@@ -239,17 +273,32 @@ function renderDashboard(origin: string, cf: any): string {
       transition: opacity 0.2s;
     }
     .copy-btn:hover { opacity: 0.85; }
+    .features-list {
+      list-style: none;
+      font-size: 0.9rem;
+      color: var(--text-muted);
+    }
+    .features-list li {
+      margin-bottom: 0.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
     .tool-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
       gap: 1rem;
       margin-top: 1rem;
     }
     .tool-card {
-      background: var(--card);
+      background: #0e1524;
       border: 1px solid var(--border);
       border-radius: 10px;
       padding: 1.2rem;
+      transition: border-color 0.2s;
+    }
+    .tool-card:hover {
+      border-color: var(--blue);
     }
     .tool-header {
       display: flex;
@@ -261,7 +310,7 @@ function renderDashboard(origin: string, cf: any): string {
       font-weight: 700;
       color: var(--text);
       font-family: monospace;
-      font-size: 1rem;
+      font-size: 0.95rem;
     }
     .badge {
       font-size: 0.7rem;
@@ -283,13 +332,13 @@ function renderDashboard(origin: string, cf: any): string {
       color: var(--text-muted);
     }
     .tool-params code {
-      background: #090d16;
+      background: #06090e;
       color: var(--blue);
       padding: 0.2rem 0.4rem;
       border-radius: 4px;
     }
     pre {
-      background: #090d16;
+      background: #06090e;
       border: 1px solid var(--border);
       padding: 1rem;
       border-radius: 8px;
@@ -313,21 +362,21 @@ function renderDashboard(origin: string, cf: any): string {
     <header>
       <div class="status-pill">
         <span class="pulse-dot"></span>
-        MCP Server Active & Healthy
+        MCP Agent Hub • Online & Active
       </div>
-      <h1>Cloudflare Workers MCP</h1>
-      <p class="lead">Universal Model Context Protocol server running globally at the edge</p>
+      <h1>mcp.sohag.com.bd</h1>
+      <p class="lead">Universal Model Context Protocol Agent Hub for Social Automation (LinkedIn, YouTube, Facebook)</p>
     </header>
 
     <div class="grid">
       <div class="card">
-        <h2>🔌 Connection Endpoints</h2>
-        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem;">Streamable HTTP Endpoint (Recommended):</p>
+        <h2>🔌 Connect with AI Agents (Muse AI, Cursor, etc.)</h2>
+        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.4rem;">Streamable HTTP Endpoint (Recommended):</p>
         <div class="url-box">
-          <span id="mcp-url">${mcpEndpoint}</span>
+          <span>${mcpEndpoint}</span>
           <button class="copy-btn" onclick="navigator.clipboard.writeText('${mcpEndpoint}')">Copy</button>
         </div>
-        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem;">SSE Endpoint (Legacy):</p>
+        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.4rem;">SSE Endpoint:</p>
         <div class="url-box">
           <span>${sseEndpoint}</span>
           <button class="copy-btn" onclick="navigator.clipboard.writeText('${sseEndpoint}')">Copy</button>
@@ -335,43 +384,41 @@ function renderDashboard(origin: string, cf: any): string {
       </div>
 
       <div class="card">
-        <h2>🌐 Edge Diagnostics</h2>
-        <ul style="list-style: none; font-size: 0.9rem; color: var(--text-muted);">
-          <li style="margin-bottom: 0.4rem;">📍 <strong>Data Center (Colo):</strong> <span style="color: var(--text);">${cf.colo || "Cloudflare Global"}</span></li>
-          <li style="margin-bottom: 0.4rem;">🌍 <strong>Country:</strong> <span style="color: var(--text);">${cf.country || "Global"}</span></li>
-          <li style="margin-bottom: 0.4rem;">⚡ <strong>Protocol:</strong> <span style="color: var(--text);">HTTP/2 & HTTP/3</span></li>
-          <li style="margin-bottom: 0.4rem;">📦 <strong>Tools Available:</strong> <span style="color: var(--green); font-weight: bold;">${TOOLS.length} Active Tools</span></li>
+        <h2>🗄️ Storage & Edge Infrastructure</h2>
+        <ul class="features-list">
+          <li>🗄️ <strong>Cloudflare D1:</strong> <span style="color: var(--green);">${env.DB ? "Active (cloudflare-mcp-db)" : "Pending"}</span></li>
+          <li>📦 <strong>Cloudflare R2:</strong> <span style="color: var(--green);">${env.MEDIA_BUCKET ? "Active (cloudflare-mcp-media)" : "Pending"}</span></li>
+          <li>🤖 <strong>Workers AI:</strong> <span style="color: var(--green);">${env.AI ? "Active (Llama 3.1 & Distill)" : "Pending"}</span></li>
+          <li>📍 <strong>Edge Colo:</strong> <span style="color: var(--blue);">${cf.colo || "Global"} (${cf.country || "Edge"})</span></li>
+          <li>⚡ <strong>Tools Registered:</strong> <span style="color: var(--accent); font-weight: bold;">${TOOLS.length} Active Tools</span></li>
         </ul>
       </div>
     </div>
 
-    <div class="card" style="margin-bottom: 2.5rem;">
-      <h2>💻 How to Connect in AI Agents / Clients</h2>
-      <p style="font-size: 0.9rem; color: var(--text-muted); margin-bottom: 1rem;">
-        Add this MCP server to your <code>claude_desktop_config.json</code>, Cursor, or AI client:
+    <div class="card" style="margin-bottom: 2rem;">
+      <h2>🤖 Muse AI / AI Agent Setup</h2>
+      <p style="font-size: 0.9rem; color: var(--text-muted); margin-bottom: 0.75rem;">
+        In Muse AI or any MCP-compatible agent, add a custom Remote MCP tool using this endpoint:
       </p>
-      <pre><code>{
-  "mcpServers": {
-    "cloudflare-mcp": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "${mcpEndpoint}"]
-    }
-  }
-}</code></pre>
+      <pre><code>Server URL: ${mcpEndpoint}
+Transport: HTTP POST (Streamable HTTP / JSON-RPC 2.0)
+Supported Actions:
+- Social Publishing: linkedin_publish_post, youtube_upload_video
+- Social Engagement: youtube_reply_comment, youtube_list_comments
+- Database Logging: db_save_post_log, db_get_post_logs, db_get_comment_logs
+- Media Storage: r2_upload_file, r2_list_files (served at /media/*)
+- Diagnostics: dns_lookup, ip_lookup, fetch_web_content, ask_ai</code></pre>
     </div>
 
     <div class="card">
       <h2>🛠️ Registered MCP Tools (${TOOLS.length})</h2>
-      <p style="font-size: 0.9rem; color: var(--text-muted);">
-        All tools are dynamically discoverable and callable by AI models via <code>tools/list</code> and <code>tools/call</code>.
-      </p>
       <div class="tool-grid">
         ${toolsHtml}
       </div>
     </div>
 
     <footer>
-      <p>Built with Cloudflare Workers • Powered by Model Context Protocol (MCP)</p>
+      <p>Domain: mcp.sohag.com.bd • Built on Cloudflare Workers • Powered by Model Context Protocol</p>
     </footer>
   </div>
 </body>

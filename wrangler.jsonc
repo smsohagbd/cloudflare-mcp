@@ -7,6 +7,29 @@
     "nodejs_compat"
   ],
   "account_id": "c536a0894f98715228542fb0a4d39135",
+  "workers_dev": true,
+  "routes": [
+    {
+      "pattern": "mcp.sohag.com.bd",
+      "custom_domain": true
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cloudflare-mcp-db",
+      "database_id": "99538b63-c3b1-4e80-9b02-7a56408c64af"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MEDIA_BUCKET",
+      "bucket_name": "cloudflare-mcp-media"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
   "observability": {
     "enabled": true
   }

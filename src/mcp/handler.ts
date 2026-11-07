@@ -61,6 +61,28 @@ export async function handleMCPRequest(
     });
   }
 
+  // Optional API key authentication if MCP_API_KEY is configured in environment
+  if (env.MCP_API_KEY) {
+    const authHeader = request.headers.get("Authorization") || "";
+    const apiKeyHeader = request.headers.get("x-api-key") || "";
+    const url = new URL(request.url);
+    const tokenParam = url.searchParams.get("key") || url.searchParams.get("token") || "";
+
+    const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : authHeader;
+    const provided = bearerToken || apiKeyHeader || tokenParam;
+
+    if (provided !== env.MCP_API_KEY) {
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32000, message: "Unauthorized: Invalid or missing API key" },
+        }),
+        { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+  }
+
   let body: any;
   try {
     body = await request.json();
@@ -289,3 +311,4 @@ async function processSingleRPC(
       };
   }
 }
+

@@ -42,3 +42,4 @@ export interface MCPToolResult {
   content: MCPToolContent[];
   isError?: boolean;
 }
+

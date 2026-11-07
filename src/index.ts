@@ -9,6 +9,8 @@ export interface Env {
   ADMIN_PASS?: string;
   JWT_SECRET?: string;
   MCP_API_KEY?: string;
+  LINKEDIN_CLIENT_ID?: string;
+  LINKEDIN_CLIENT_SECRET?: string;
   LINKEDIN_ACCESS_TOKEN?: string;
   YOUTUBE_ACCESS_TOKEN?: string;
   YOUTUBE_API_KEY?: string;
@@ -102,6 +104,119 @@ export default {
       headers.set("Cache-Control", "public, max-age=31536000, immutable");
 
       return new Response(object.body, { headers });
+    }
+
+    // LinkedIn OAuth Step 1: Redirect user to LinkedIn authorization page
+    if (url.pathname === "/auth/linkedin") {
+      const clientId = env.LINKEDIN_CLIENT_ID || "862xwbz3mk9f4n";
+      const redirectUri = `${url.origin}/auth/linkedin/callback`;
+      const scopes = encodeURIComponent("openid profile w_member_social email");
+      const linkedinAuthUrl = `https://www.linkedin.com/oauth/v2/authorization?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${scopes}&state=mcp_linkedin`;
+
+      return Response.redirect(linkedinAuthUrl, 302);
+    }
+
+    // LinkedIn OAuth Step 2: Callback handler
+    if (url.pathname === "/auth/linkedin/callback") {
+      const error = url.searchParams.get("error");
+      const errorDesc = url.searchParams.get("error_description");
+      if (error) {
+        return new Response(
+          renderOAuthResult("LinkedIn Connection Failed", `LinkedIn error: ${error} - ${errorDesc || ""}`, false, url.origin),
+          { status: 400, headers: { "Content-Type": "text/html; charset=utf-8" } }
+        );
+      }
+
+      const code = url.searchParams.get("code");
+      if (!code) {
+        return new Response(
+          renderOAuthResult("Missing Authorization Code", "No authorization code received from LinkedIn.", false, url.origin),
+          { status: 400, headers: { "Content-Type": "text/html; charset=utf-8" } }
+        );
+      }
+
+      const clientId = env.LINKEDIN_CLIENT_ID || "862xwbz3mk9f4n";
+      const clientSecret = env.LINKEDIN_CLIENT_SECRET || "";
+      const redirectUri = `${url.origin}/auth/linkedin/callback`;
+
+      try {
+        const tokenRes = await fetch("https://www.linkedin.com/oauth/v2/accessToken", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code,
+            client_id: clientId,
+            client_secret: clientSecret,
+            redirect_uri: redirectUri,
+          }).toString(),
+        });
+
+        if (!tokenRes.ok) {
+          const errBody = await tokenRes.text();
+          return new Response(
+            renderOAuthResult("Token Exchange Failed", `LinkedIn rejected token exchange: ${errBody}`, false, url.origin),
+            { status: 400, headers: { "Content-Type": "text/html; charset=utf-8" } }
+          );
+        }
+
+        const tokenData = (await tokenRes.json()) as any;
+        const accessToken = tokenData.access_token;
+        const refreshToken = tokenData.refresh_token || null;
+        const expiresIn = tokenData.expires_in || 5184000;
+        const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
+
+        // Query userinfo to get member URN and name
+        let memberName = "LinkedIn User";
+        let authorUrn = "urn:li:person:me";
+        try {
+          const profileRes = await fetch("https://api.linkedin.com/v2/userinfo", {
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+          if (profileRes.ok) {
+            const profile = (await profileRes.json()) as any;
+            memberName = profile.name || memberName;
+            if (profile.sub) {
+              authorUrn = `urn:li:person:${profile.sub}`;
+            }
+          }
+        } catch {}
+
+        if (env.DB) {
+          const extraData = JSON.stringify({
+            name: memberName,
+            author_urn: authorUrn,
+            connectedVia: "1-Click OAuth",
+          });
+          const now = new Date().toISOString();
+
+          await env.DB.prepare(`
+            INSERT INTO social_credentials (platform, access_token, refresh_token, token_type, expires_at, extra_data, updated_at)
+            VALUES ('linkedin', ?, ?, 'Bearer', ?, ?, ?)
+            ON CONFLICT(platform) DO UPDATE SET
+              access_token = excluded.access_token,
+              refresh_token = COALESCE(excluded.refresh_token, social_credentials.refresh_token),
+              expires_at = excluded.expires_at,
+              extra_data = excluded.extra_data,
+              updated_at = excluded.updated_at
+          `).bind(accessToken, refreshToken, expiresAt, extraData, now).run();
+        }
+
+        return new Response(
+          renderOAuthResult(
+            "LinkedIn Successfully Connected!",
+            `Connected as <strong>${memberName}</strong> (${authorUrn})! Token saved to Cloudflare D1. Muse AI can now publish posts automatically!`,
+            true,
+            url.origin
+          ),
+          { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } }
+        );
+      } catch (err: any) {
+        return new Response(
+          renderOAuthResult("Connection Error", err.message, false, url.origin),
+          { status: 500, headers: { "Content-Type": "text/html; charset=utf-8" } }
+        );
+      }
     }
 
     // Auth endpoint: POST /api/login
@@ -714,6 +829,27 @@ function renderDashboard(origin: string, cf: any, env: Env): string {
 
         <!-- Tab 4: Social Credentials -->
         <div id="credentials-tab" class="tab-content" style="display: none;">
+          <!-- 1-Click LinkedIn OAuth Banner -->
+          <div style="background: rgba(10, 102, 194, 0.12); border: 1px solid rgba(10, 102, 194, 0.35); border-radius: 10px; padding: 1.25rem; margin-bottom: 1.25rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem;">
+              <div>
+                <h4 style="margin: 0 0 0.25rem; color: #38bdf8; font-size: 1.05rem; display: flex; align-items: center; gap: 0.5rem;">
+                  <span>🔗</span> 1-Click LinkedIn Connect (App: <code>862xwbz3mk9f4n</code>)
+                </h4>
+                <p style="margin: 0; font-size: 0.85rem; color: var(--text-muted);">
+                  Authorize directly in your browser. Tokens are automatically exchanged and saved to Cloudflare D1.
+                </p>
+              </div>
+              <a href="/auth/linkedin" class="btn btn-primary" style="background: #0a66c2; text-decoration: none; padding: 0.6rem 1.2rem;">
+                🚀 Connect LinkedIn with 1-Click
+              </a>
+            </div>
+            <div style="margin-top: 0.75rem; font-size: 0.75rem; color: var(--text-muted); border-top: 1px dashed rgba(56, 189, 248, 0.2); padding-top: 0.5rem;">
+              ⚠️ <strong>Required:</strong> In your LinkedIn Developer App (<code>862xwbz3mk9f4n</code>), go to <strong>Auth</strong> &rarr; <strong>OAuth 2.0 settings</strong> &rarr; add Redirect URL:
+              <code style="color: var(--accent); background: #06090e; padding: 0.15rem 0.4rem; border-radius: 4px;">https://mcp.sohag.com.bd/auth/linkedin/callback</code>
+            </div>
+          </div>
+
           <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1.5rem; margin-top: 0.5rem;">
             <!-- Current Status Table -->
             <div>
@@ -1135,6 +1271,35 @@ Key Automation Tools:
         .replace(/'/g, "&#039;");
     }
   </script>
+</body>
+</html>`;
+}
+
+function renderOAuthResult(title: string, message: string, success: boolean, origin: string): string {
+  const icon = success ? "🎉" : "⚠️";
+  const color = success ? "#22c55e" : "#ef4444";
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${title}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #090d16; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 1.5rem; }
+    .card { background: #131c2e; border: 1px solid #26334d; border-radius: 14px; padding: 2.5rem 2rem; max-width: 480px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    h1 { color: ${color}; font-size: 1.5rem; margin: 0.75rem 0; font-weight: 700; }
+    p { color: #94a3b8; font-size: 0.95rem; line-height: 1.6; margin-bottom: 2rem; }
+    .btn { display: inline-block; background: #f38020; color: white; text-decoration: none; padding: 0.75rem 1.75rem; border-radius: 8px; font-weight: 600; transition: opacity 0.2s; }
+    .btn:hover { opacity: 0.9; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div style="font-size: 3.5rem;">${icon}</div>
+    <h1>${title}</h1>
+    <p>${message}</p>
+    <a href="${origin}" class="btn">&larr; Return to Dashboard</a>
+  </div>
 </body>
 </html>`;
 }

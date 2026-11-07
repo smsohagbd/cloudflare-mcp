@@ -30,6 +30,9 @@
   "ai": {
     "binding": "AI"
   },
+  "vars": {
+    "LINKEDIN_CLIENT_ID": "862xwbz3mk9f4n"
+  },
   "observability": {
     "enabled": true
   }

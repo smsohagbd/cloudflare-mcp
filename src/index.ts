@@ -153,6 +153,57 @@ export default {
       });
     }
 
+    // Admin Credentials update: POST /api/admin/credentials
+    if (url.pathname === "/api/admin/credentials" && request.method === "POST") {
+      const token = extractToken(request);
+      const secret = env.JWT_SECRET || DEFAULT_SECRET;
+      const isValid = token ? await verifyToken(token, secret) : false;
+
+      if (!isValid) {
+        return new Response(JSON.stringify({ error: "Unauthorized. Please log in." }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      if (!env.DB) {
+        return new Response(JSON.stringify({ error: "Database not connected" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      let body: any = {};
+      try { body = await request.json(); } catch {}
+      const platform = String(body.platform || "").toLowerCase();
+      const accessToken = String(body.access_token || "").trim();
+      const refreshToken = body.refresh_token ? String(body.refresh_token).trim() : null;
+      const extraData = body.extra_data ? String(body.extra_data).trim() : null;
+
+      if (!platform || !accessToken) {
+        return new Response(JSON.stringify({ error: "Platform and Access Token are required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      const now = new Date().toISOString();
+      await env.DB.prepare(`
+        INSERT INTO social_credentials (platform, access_token, refresh_token, token_type, extra_data, updated_at)
+        VALUES (?, ?, ?, 'Bearer', ?, ?)
+        ON CONFLICT(platform) DO UPDATE SET
+          access_token = excluded.access_token,
+          refresh_token = COALESCE(excluded.refresh_token, social_credentials.refresh_token),
+          extra_data = COALESCE(excluded.extra_data, social_credentials.extra_data),
+          updated_at = excluded.updated_at
+      `).bind(platform, accessToken, refreshToken, extraData, now).run();
+
+      return new Response(JSON.stringify({ success: true, message: `Successfully saved ${platform} credentials to Cloudflare D1!` }), {
+        status: 200,
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
+    }
+
     // Live Admin Logs endpoint: GET /api/admin/logs
     if (url.pathname === "/api/admin/logs") {
       const token = extractToken(request);
@@ -663,21 +714,69 @@ function renderDashboard(origin: string, cf: any, env: Env): string {
 
         <!-- Tab 4: Social Credentials -->
         <div id="credentials-tab" class="tab-content" style="display: none;">
-          <div class="table-container">
-            <table>
-              <thead>
-                <tr>
-                  <th>Platform</th>
-                  <th>Token Type</th>
-                  <th>Expires At</th>
-                  <th>Last Updated</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody id="credentials-table-body">
-                <tr><td colspan="5" style="text-align: center; color: var(--text-muted);">Loading credentials...</td></tr>
-              </tbody>
-            </table>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1.5rem; margin-top: 0.5rem;">
+            <!-- Current Status Table -->
+            <div>
+              <h3 style="font-size: 1rem; color: var(--blue); margin-bottom: 0.75rem;">Connected Accounts</h3>
+              <div class="table-container">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Platform</th>
+                      <th>Token Type</th>
+                      <th>Last Updated</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="credentials-table-body">
+                    <tr><td colspan="4" style="text-align: center; color: var(--text-muted);">Loading credentials...</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <!-- Credentials Setup Form -->
+            <div style="background: #090e18; border: 1px solid var(--border); border-radius: 10px; padding: 1.25rem;">
+              <h3 style="font-size: 1rem; color: var(--accent); margin-bottom: 0.5rem;">⚙️ Set / Update API Credentials</h3>
+              <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem;">
+                Store your OAuth access tokens in Cloudflare D1 so Muse AI can automatically publish.
+              </p>
+              <form onsubmit="handleCredentialSubmit(event)">
+                <div class="form-group" style="margin-bottom: 0.85rem;">
+                  <label style="font-size: 0.8rem; color: var(--text-muted); display: block; margin-bottom: 0.3rem;">Target Platform</label>
+                  <select id="cred-platform" class="form-control" style="background: #131c2e; color: white;" required>
+                    <option value="linkedin">LinkedIn</option>
+                    <option value="youtube">YouTube (Google OAuth)</option>
+                    <option value="facebook">Facebook / Meta</option>
+                  </select>
+                </div>
+                <div class="form-group" style="margin-bottom: 0.85rem;">
+                  <label style="font-size: 0.8rem; color: var(--text-muted); display: block; margin-bottom: 0.3rem;">Access Token (OAuth Bearer)</label>
+                  <input type="password" id="cred-token" class="form-control" placeholder="Paste access_token here..." required>
+                </div>
+                <div class="form-group" style="margin-bottom: 0.85rem;">
+                  <label style="font-size: 0.8rem; color: var(--text-muted); display: block; margin-bottom: 0.3rem;">Refresh Token (Optional)</label>
+                  <input type="password" id="cred-refresh" class="form-control" placeholder="Optional refresh_token">
+                </div>
+                <div class="form-group" style="margin-bottom: 1rem;">
+                  <label style="font-size: 0.8rem; color: var(--text-muted); display: block; margin-bottom: 0.3rem;">Extra Metadata (Optional JSON e.g. Channel ID / URN)</label>
+                  <input type="text" id="cred-extra" class="form-control" placeholder='{"channel_id": "UC..."}'>
+                </div>
+                <div id="cred-status-msg" style="font-size: 0.85rem; margin-bottom: 0.85rem; display: none;"></div>
+                <button type="submit" id="btn-save-cred" class="btn btn-primary btn-sm" style="width: 100%; justify-content: center;">
+                  💾 Save Credentials to Cloudflare D1
+                </button>
+              </form>
+            </div>
+          </div>
+
+          <!-- Quick Help Card -->
+          <div style="background: rgba(56, 189, 248, 0.05); border: 1px solid rgba(56, 189, 248, 0.2); border-radius: 8px; padding: 1rem; margin-top: 1.25rem; font-size: 0.85rem;">
+            <strong style="color: var(--blue);">💡 Where to get your API Tokens:</strong>
+            <ul style="margin-top: 0.5rem; padding-left: 1.2rem; color: var(--text-muted);">
+              <li><strong>LinkedIn:</strong> Go to <a href="https://www.linkedin.com/developers/" target="_blank" style="color: var(--blue);">LinkedIn Developer Portal</a> &rarr; Create App &rarr; Add <em>Share on LinkedIn</em> product &rarr; Generate OAuth 2.0 User Token with scope <code>w_member_social</code>.</li>
+              <li><strong>YouTube:</strong> Go to <a href="https://console.cloud.google.com/" target="_blank" style="color: var(--blue);">Google Cloud Console</a> &rarr; Enable <em>YouTube Data API v3</em> &rarr; Create OAuth 2.0 Client &rarr; Generate Access Token via <a href="https://developers.google.com/oauthplayground/" target="_blank" style="color: var(--blue);">Google OAuth Playground</a> (scope: <code>https://www.googleapis.com/auth/youtube.upload</code>).</li>
+            </ul>
           </div>
         </div>
       </div>
@@ -959,11 +1058,58 @@ Key Automation Tools:
         return '<tr>' +
           '<td><strong style="text-transform: capitalize; color: var(--accent);">' + plat + '</strong></td>' +
           '<td>' + (configured ? (item.token_type || "Bearer") : "-") + '</td>' +
-          '<td style="font-size: 0.8rem; color: var(--text-muted);">' + (configured && item.expires_at ? item.expires_at : "N/A") + '</td>' +
           '<td style="font-size: 0.8rem; color: var(--text-muted);">' + (configured && item.updated_at ? item.updated_at : "Never") + '</td>' +
-          '<td><span class="badge-status ' + (configured ? "badge-published" : "badge-failed") + '">' + (configured ? "Configured" : "Not Set") + '</span></td>' +
+          '<td><span class="badge-status ' + (configured ? "badge-published" : "badge-failed") + '">' + (configured ? "Connected" : "Not Configured") + '</span></td>' +
         '</tr>';
       }).join("");
+    }
+
+    async function handleCredentialSubmit(e) {
+      e.preventDefault();
+      const platform = document.getElementById("cred-platform").value;
+      const accessToken = document.getElementById("cred-token").value.trim();
+      const refreshToken = document.getElementById("cred-refresh").value.trim();
+      const extraData = document.getElementById("cred-extra").value.trim();
+      const msgDiv = document.getElementById("cred-status-msg");
+      const btn = document.getElementById("btn-save-cred");
+
+      btn.disabled = true;
+      btn.textContent = "Saving to D1...";
+      msgDiv.style.display = "none";
+
+      try {
+        const res = await fetch("/api/admin/credentials", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            platform,
+            access_token: accessToken,
+            refresh_token: refreshToken || undefined,
+            extra_data: extraData || undefined
+          })
+        });
+        const data = await res.json();
+        if (data.success) {
+          msgDiv.style.color = "var(--green)";
+          msgDiv.textContent = "✅ " + data.message;
+          msgDiv.style.display = "block";
+          document.getElementById("cred-token").value = "";
+          document.getElementById("cred-refresh").value = "";
+          document.getElementById("cred-extra").value = "";
+          await refreshAdminLogs();
+        } else {
+          msgDiv.style.color = "var(--red)";
+          msgDiv.textContent = "❌ " + (data.error || "Failed to save");
+          msgDiv.style.display = "block";
+        }
+      } catch (err) {
+        msgDiv.style.color = "var(--red)";
+        msgDiv.textContent = "❌ Network error";
+        msgDiv.style.display = "block";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "💾 Save Credentials to Cloudflare D1";
+      }
     }
 
     function switchTab(tabId) {

@@ -51,3 +51,4 @@ It connects external AI agents (such as **Muse AI**, Claude Desktop, Cursor, Ant
 - Do NOT re-scan the whole codebase when working in this directory. Refer to this document and `src/tools/index.ts`.
 - When adding a new tool, define the schema in `general.ts`, `storage.ts`, or `social.ts`, and register the execution handler.
 - Always run `npm run typecheck` before `npm run deploy`.
+

@@ -39,3 +39,4 @@ CREATE TABLE IF NOT EXISTS social_credentials (
 CREATE INDEX IF NOT EXISTS idx_post_logs_platform ON post_logs(platform);
 CREATE INDEX IF NOT EXISTS idx_post_logs_status ON post_logs(status);
 CREATE INDEX IF NOT EXISTS idx_comments_platform_post ON comments_log(platform, post_id);
+

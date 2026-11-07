@@ -54,3 +54,4 @@ External agents like **Muse AI** connect to this MCP server to plan and automate
 * `src/tools/social.ts`: LinkedIn and YouTube API calls
 * `schema.sql`: D1 database schema
 * `wrangler.jsonc`: Cloudflare configuration
+

@@ -437,8 +437,21 @@ export default {
     if (url.pathname === "/api/login" && request.method === "POST") {
       let body: any = {};
       try { body = await request.json(); } catch {}
-      const targetUser = env.ADMIN_USER || "smsohag";
-      const targetPass = env.ADMIN_PASS || "SOhag@#";
+      let targetUser = env.ADMIN_USER || "smsohag";
+      let targetPass = env.ADMIN_PASS || "SOhag@#";
+
+      if (env.DB) {
+        try {
+          const row: any = await env.DB.prepare("SELECT access_token, extra_data FROM social_credentials WHERE platform = 'admin_auth'").first();
+          if (row && row.access_token) {
+            targetPass = row.access_token;
+            if (row.extra_data) {
+              const extra = JSON.parse(row.extra_data);
+              if (extra.username) targetUser = extra.username;
+            }
+          }
+        } catch {}
+      }
 
       if (body.username === targetUser && body.password === targetPass) {
         const secret = env.JWT_SECRET || DEFAULT_SECRET;
@@ -476,10 +489,106 @@ export default {
       const token = extractToken(request);
       const secret = env.JWT_SECRET || DEFAULT_SECRET;
       const isValid = token ? await verifyToken(token, secret) : false;
-      return new Response(JSON.stringify({ authenticated: isValid, user: isValid ? "smsohag" : null }), {
+      let username = "smsohag";
+      if (isValid && env.DB) {
+        try {
+          const row: any = await env.DB.prepare("SELECT extra_data FROM social_credentials WHERE platform = 'admin_auth'").first();
+          if (row && row.extra_data) {
+            const extra = JSON.parse(row.extra_data);
+            if (extra.username) username = extra.username;
+          }
+        } catch {}
+      }
+      return new Response(JSON.stringify({ authenticated: isValid, user: isValid ? username : null }), {
         status: 200,
         headers: { "Content-Type": "application/json", ...corsHeaders },
       });
+    }
+
+    // Change Admin Credentials: POST /api/admin/change-password
+    if (url.pathname === "/api/admin/change-password" && request.method === "POST") {
+      const token = extractToken(request);
+      const secret = env.JWT_SECRET || DEFAULT_SECRET;
+      const isValid = token ? await verifyToken(token, secret) : false;
+
+      if (!isValid) {
+        return new Response(JSON.stringify({ error: "Unauthorized. Please log in first." }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      if (!env.DB) {
+        return new Response(JSON.stringify({ error: "Database not connected" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      let body: any = {};
+      try { body = await request.json(); } catch {}
+      const currentPass = String(body.current_password || "").trim();
+      const newUsername = String(body.new_username || "").trim();
+      const newPassword = String(body.new_password || "").trim();
+
+      if (!newUsername || !newPassword) {
+        return new Response(JSON.stringify({ error: "New username and password are required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      if (newPassword.length < 6) {
+        return new Response(JSON.stringify({ error: "New password must be at least 6 characters" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      // Verify current password
+      let targetPass = env.ADMIN_PASS || "SOhag@#";
+      try {
+        const row: any = await env.DB.prepare("SELECT access_token FROM social_credentials WHERE platform = 'admin_auth'").first();
+        if (row && row.access_token) {
+          targetPass = row.access_token;
+        }
+      } catch {}
+
+      if (currentPass !== targetPass) {
+        return new Response(JSON.stringify({ error: "Current password is incorrect" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      const now = new Date().toISOString();
+      const extraData = JSON.stringify({ username: newUsername });
+      await env.DB.prepare(`
+        INSERT INTO social_credentials (platform, access_token, token_type, extra_data, updated_at)
+        VALUES ('admin_auth', ?, 'AdminAuth', ?, ?)
+        ON CONFLICT(platform) DO UPDATE SET
+          access_token = excluded.access_token,
+          extra_data = excluded.extra_data,
+          updated_at = excluded.updated_at
+      `).bind(newPassword, extraData, now).run();
+
+      const newToken = await createToken(newUsername, secret);
+      return new Response(
+        JSON.stringify({
+          success: true,
+          message: "Admin credentials successfully updated and secured in Cloudflare D1!",
+          user: newUsername,
+          token: newToken,
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "Set-Cookie": `mcp_session=${encodeURIComponent(newToken)}; Path=/; Max-Age=1209600; SameSite=Lax; Secure`,
+            ...corsHeaders,
+          },
+        }
+      );
     }
 
     // Admin Credentials update: POST /api/admin/credentials
@@ -1068,7 +1177,7 @@ export default {
 
           const credRows = await env.DB.prepare("SELECT platform, token_type, expires_at, extra_data, updated_at FROM social_credentials").all();
           const allCreds = credRows.results || [];
-          credentials = allCreds.filter((c: any) => !c.platform.endsWith("_oauth_app"));
+          credentials = allCreds.filter((c: any) => !c.platform.endsWith("_oauth_app") && c.platform !== "admin_auth");
 
           // Compute stats
           stats.totalPosts = posts.length;
@@ -1099,6 +1208,44 @@ export default {
         github: { clientId: ghApp.clientId, hasSecret: !!ghApp.clientSecret },
       };
 
+      const parseJsonSafe = (str: any) => {
+        if (!str) return null;
+        if (typeof str === "object") return str;
+        try { return JSON.parse(str); } catch { return null; }
+      };
+
+      const liCred = credentials.find((c: any) => c.platform === "linkedin");
+      const ghCred = credentials.find((c: any) => c.platform === "github");
+      const ytCred = credentials.find((c: any) => c.platform === "youtube");
+      const fbCred = credentials.find((c: any) => c.platform === "facebook");
+
+      const platformSummaries = {
+        linkedin: {
+          hasAppSecret: !!liApp.clientSecret,
+          appClientId: liApp.clientId,
+          isConnected: !!liCred,
+          extra: parseJsonSafe(liCred?.extra_data),
+          updatedAt: liCred?.updated_at || null,
+        },
+        github: {
+          hasAppSecret: !!ghApp.clientSecret,
+          appClientId: ghApp.clientId,
+          isConnected: !!ghCred,
+          extra: parseJsonSafe(ghCred?.extra_data),
+          updatedAt: ghCred?.updated_at || null,
+        },
+        youtube: {
+          isConnected: !!ytCred,
+          extra: parseJsonSafe(ytCred?.extra_data),
+          updatedAt: ytCred?.updated_at || null,
+        },
+        facebook: {
+          isConnected: !!fbCred,
+          extra: parseJsonSafe(fbCred?.extra_data),
+          updatedAt: fbCred?.updated_at || null,
+        },
+      };
+
       return new Response(
         JSON.stringify({
           success: true,
@@ -1108,6 +1255,7 @@ export default {
           media,
           credentials,
           oauthApps,
+          platformSummaries,
           timestamp: new Date().toISOString(),
         }),
         {
@@ -1423,8 +1571,13 @@ function renderDashboard(origin: string, cf: any, env: Env): string {
         <div id="auth-logged-out">
           <button class="btn btn-primary btn-sm" onclick="openLoginModal()">🔒 Admin Login</button>
         </div>
-        <div id="auth-logged-in" style="display: none; align-items: center; gap: 0.75rem;">
-          <span style="font-size: 0.85rem; color: var(--green);">👤 <strong id="admin-username-display">smsohag</strong></span>
+        <div id="auth-logged-in" style="display: none; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
+          <span style="font-size: 0.85rem; color: var(--green); display: flex; align-items: center; gap: 0.35rem;">
+            <span>🛡️</span> <strong id="admin-username-display">smsohag</strong> (Admin)
+          </span>
+          <button class="btn btn-outline btn-sm" onclick="openChangePasswordModal()" style="color: var(--accent); border-color: var(--accent);" title="Change admin username and password">
+            🔑 Change Password
+          </button>
           <button class="btn btn-outline btn-sm" onclick="refreshAdminLogs()">🔄 Refresh</button>
           <button class="btn btn-danger btn-sm" onclick="logoutAdmin()">🚪 Logout</button>
         </div>
@@ -1441,8 +1594,20 @@ function renderDashboard(origin: string, cf: any, env: Env): string {
       <p class="lead">Universal Model Context Protocol server for Social Automation (LinkedIn, YouTube, Facebook)</p>
     </header>
 
+    <!-- ADMIN CONSOLE LOCKED BANNER (Shown when Logged Out) -->
+    <div id="auth-lock-card" class="card" style="border: 1px solid rgba(56, 189, 248, 0.35); text-align: center; padding: 2.75rem 1.5rem; margin-bottom: 2rem; background: rgba(14, 21, 36, 0.95);">
+      <div style="font-size: 3rem; margin-bottom: 0.75rem;">🔒</div>
+      <h2 style="font-size: 1.4rem; color: var(--text); margin-bottom: 0.5rem; justify-content: center;">Admin Control Center Locked</h2>
+      <p style="font-size: 0.92rem; color: var(--text-muted); max-width: 540px; margin: 0 auto 1.5rem; line-height: 1.6;">
+        Social platform integrations, credentials, and live activity logs are password-protected. Sign in with your administrator credentials to manage connections or publish actions.
+      </p>
+      <button class="btn btn-primary" onclick="openLoginModal()" style="padding: 0.65rem 1.75rem; font-size: 0.95rem;">
+        🔒 Admin Sign In
+      </button>
+    </div>
+
     <!-- LIVE ADMIN CONSOLE (Shown after Login) -->
-    <div id="admin-panel">
+    <div id="admin-panel" style="display: none;">
       <div class="card" style="border-color: var(--accent);">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem;">
           <h2>📊 Live Control Console & Activity Logs</h2>
@@ -1558,47 +1723,51 @@ function renderDashboard(origin: string, cf: any, env: Env): string {
 
         <!-- Tab 4: Social Credentials -->
         <div id="credentials-tab" class="tab-content" style="display: none;">
-          <!-- 1-Click Integration Banners -->
-          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1rem; margin-bottom: 1.25rem;">
-            <!-- LinkedIn 1-Click Banner -->
-            <div style="background: rgba(10, 102, 194, 0.12); border: 1px solid rgba(10, 102, 194, 0.35); border-radius: 10px; padding: 1.25rem;">
-              <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem;">
-                <div>
-                  <h4 style="margin: 0 0 0.25rem; color: #38bdf8; font-size: 1.05rem; display: flex; align-items: center; gap: 0.5rem;">
-                    <span>🔗</span> 1-Click LinkedIn Connect (App: <code>862xwbz3mk9f4n</code>)
-                    <span id="badge-li-secret-status" class="badge-status badge-failed" style="font-size: 0.7rem;">Secret Missing</span>
-                  </h4>
-                  <p style="margin: 0; font-size: 0.82rem; color: var(--text-muted);">
-                    Authorize in browser. Tokens are automatically exchanged and saved to Cloudflare D1.
-                  </p>
+          <!-- Live Platform Integration Cards -->
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1rem; margin-bottom: 1.5rem;">
+            <!-- LinkedIn Platform Hub Card -->
+            <div id="card-linkedin" style="background: rgba(10, 102, 194, 0.08); border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 12px; padding: 1.25rem; transition: all 0.3s ease;">
+              <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 0.5rem; margin-bottom: 0.75rem;">
+                <div style="display: flex; align-items: center; gap: 0.6rem;">
+                  <span style="font-size: 1.6rem;">🔗</span>
+                  <div>
+                    <h4 style="margin: 0; font-size: 1.05rem; color: #38bdf8;">LinkedIn Integration</h4>
+                    <span style="font-size: 0.75rem; color: var(--text-muted);">Auto-publishing posts &amp; articles</span>
+                  </div>
                 </div>
-                <a href="/auth/linkedin" class="btn btn-primary btn-sm" style="background: #0a66c2; text-decoration: none;">
-                  🚀 Connect LinkedIn
-                </a>
+                <span id="li-status-badge" class="badge-status badge-pending" style="font-size: 0.72rem;">CHECKING...</span>
               </div>
-              <div style="margin-top: 0.65rem; font-size: 0.75rem; color: var(--text-muted); border-top: 1px dashed rgba(56, 189, 248, 0.2); padding-top: 0.4rem;">
-                📌 <strong>App Products Required:</strong> "Share on LinkedIn" &amp; "Sign In with LinkedIn using OpenID Connect"<br>
-                OAuth Redirect: <code style="color: var(--accent); background: #06090e; padding: 0.1rem 0.3rem; border-radius: 4px;">https://mcp.sohag.com.bd/auth/linkedin/callback</code>
+              <div id="li-status-desc" style="background: rgba(6, 9, 14, 0.6); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 8px; padding: 0.75rem; margin-bottom: 0.85rem; font-size: 0.83rem; line-height: 1.5;">
+                Loading LinkedIn status...
+              </div>
+              <div id="li-actions" style="display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;">
+                <!-- Populated dynamically by renderPlatformCards -->
+              </div>
+              <div style="margin-top: 0.75rem; font-size: 0.72rem; color: var(--text-muted); border-top: 1px dashed rgba(56, 189, 248, 0.2); padding-top: 0.4rem;">
+                App ID: <code>862xwbz3mk9f4n</code> &bull; Redirect: <code>https://mcp.sohag.com.bd/auth/linkedin/callback</code>
               </div>
             </div>
 
-            <!-- GitHub Integration Banner -->
-            <div style="background: rgba(147, 51, 234, 0.12); border: 1px solid rgba(147, 51, 234, 0.35); border-radius: 10px; padding: 1.25rem;">
-              <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem;">
-                <div>
-                  <h4 style="margin: 0 0 0.25rem; color: #c084fc; font-size: 1.05rem; display: flex; align-items: center; gap: 0.5rem;">
-                    <span>🐙</span> GitHub Integration (Issues, Gists, Repos)
-                  </h4>
-                  <p style="margin: 0; font-size: 0.82rem; color: var(--text-muted);">
-                    Connect GitHub with a PAT or OAuth so AI agents can manage code and repositories.
-                  </p>
+            <!-- GitHub Platform Hub Card -->
+            <div id="card-github" style="background: rgba(147, 51, 234, 0.08); border: 1px solid rgba(192, 132, 252, 0.35); border-radius: 12px; padding: 1.25rem; transition: all 0.3s ease;">
+              <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 0.5rem; margin-bottom: 0.75rem;">
+                <div style="display: flex; align-items: center; gap: 0.6rem;">
+                  <span style="font-size: 1.6rem;">🐙</span>
+                  <div>
+                    <h4 style="margin: 0; font-size: 1.05rem; color: #c084fc;">GitHub Integration</h4>
+                    <span style="font-size: 0.75rem; color: var(--text-muted);">Code, Repos, Issues &amp; Gists</span>
+                  </div>
                 </div>
-                <button class="btn btn-primary btn-sm" onclick="connectPlatform('github')" style="background: #7e22ce;">
-                  ➕ Set GitHub Token
-                </button>
+                <span id="gh-status-badge" class="badge-status badge-failed" style="font-size: 0.72rem;">CHECKING...</span>
               </div>
-              <div style="margin-top: 0.65rem; font-size: 0.72rem; color: var(--text-muted); border-top: 1px dashed rgba(192, 132, 252, 0.2); padding-top: 0.4rem;">
-                Scopes needed: <code>repo</code>, <code>gist</code>, <code>read:user</code> &bull; <a href="/auth/github" style="color: #c084fc; text-decoration: underline;">1-Click OAuth (if configured)</a>
+              <div id="gh-status-desc" style="background: rgba(6, 9, 14, 0.6); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 8px; padding: 0.75rem; margin-bottom: 0.85rem; font-size: 0.83rem; line-height: 1.5;">
+                Loading GitHub status...
+              </div>
+              <div id="gh-actions" style="display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;">
+                <!-- Populated dynamically by renderPlatformCards -->
+              </div>
+              <div style="margin-top: 0.75rem; font-size: 0.72rem; color: var(--text-muted); border-top: 1px dashed rgba(192, 132, 252, 0.2); padding-top: 0.4rem;">
+                Scopes needed: <code>repo</code>, <code>gist</code>, <code>read:user</code>
               </div>
             </div>
           </div>
@@ -1659,7 +1828,8 @@ function renderDashboard(origin: string, cf: any, env: Env): string {
                   <thead>
                     <tr>
                       <th>Platform</th>
-                      <th>Account / Details</th>
+                      <th>Account Identity</th>
+                      <th>App Secret</th>
                       <th>Token Type</th>
                       <th>Last Updated</th>
                       <th>Status</th>
@@ -1667,7 +1837,7 @@ function renderDashboard(origin: string, cf: any, env: Env): string {
                     </tr>
                   </thead>
                   <tbody id="credentials-table-body">
-                    <tr><td colspan="6" style="text-align: center; color: var(--text-muted);">Loading credentials...</td></tr>
+                    <tr><td colspan="7" style="text-align: center; color: var(--text-muted);">Loading credentials...</td></tr>
                   </tbody>
                 </table>
               </div>
@@ -1820,6 +1990,36 @@ Key Automation Tools:
     </div>
   </div>
 
+  <!-- Change Password Modal -->
+  <div class="modal-overlay" id="change-password-modal">
+    <div class="modal">
+      <h3>🔑 Change Admin Password</h3>
+      <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.25rem; text-align: center;">
+        Set your private credentials to secure your MCP server in Cloudflare D1.
+      </p>
+      <form onsubmit="handleChangePasswordSubmit(event)">
+        <div class="form-group">
+          <label>Current Password</label>
+          <input type="password" id="cp-current-password" class="form-control" placeholder="Current password" required>
+        </div>
+        <div class="form-group">
+          <label>New Admin Username</label>
+          <input type="text" id="cp-new-username" class="form-control" placeholder="smsohag" required>
+        </div>
+        <div class="form-group">
+          <label>New Admin Password (min. 6 chars)</label>
+          <input type="password" id="cp-new-password" class="form-control" placeholder="New strong password" required>
+        </div>
+        <div id="cp-error" class="error-msg"></div>
+        <div id="cp-success" style="color: var(--green); font-size: 0.85rem; margin-top: 0.5rem; display: none;"></div>
+        <div style="display: flex; gap: 0.5rem; margin-top: 1.5rem;">
+          <button type="button" class="btn btn-outline" style="flex: 1;" onclick="closeChangePasswordModal()">Cancel</button>
+          <button type="submit" id="btn-save-password" class="btn btn-primary" style="flex: 1;">Save Credentials</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <script>
     let pollInterval = null;
 
@@ -1846,6 +2046,8 @@ Key Automation Tools:
       document.getElementById("auth-logged-out").style.display = "none";
       document.getElementById("auth-logged-in").style.display = "flex";
       document.getElementById("admin-username-display").textContent = username;
+      const lockCard = document.getElementById("auth-lock-card");
+      if (lockCard) lockCard.style.display = "none";
       document.getElementById("admin-panel").style.display = "block";
       refreshAdminLogs();
       toggleAutoRefresh(true);
@@ -1854,8 +2056,66 @@ Key Automation Tools:
     function hideAdminPanel() {
       document.getElementById("auth-logged-out").style.display = "block";
       document.getElementById("auth-logged-in").style.display = "none";
+      const lockCard = document.getElementById("auth-lock-card");
+      if (lockCard) lockCard.style.display = "block";
       document.getElementById("admin-panel").style.display = "none";
       toggleAutoRefresh(false);
+    }
+
+    function openChangePasswordModal() {
+      document.getElementById("change-password-modal").style.display = "flex";
+      document.getElementById("cp-error").style.display = "none";
+      document.getElementById("cp-success").style.display = "none";
+      document.getElementById("cp-current-password").value = "";
+      document.getElementById("cp-new-username").value = document.getElementById("admin-username-display").textContent || "smsohag";
+      document.getElementById("cp-new-password").value = "";
+      document.getElementById("cp-current-password").focus();
+    }
+
+    function closeChangePasswordModal() {
+      document.getElementById("change-password-modal").style.display = "none";
+    }
+
+    async function handleChangePasswordSubmit(e) {
+      e.preventDefault();
+      const current_password = document.getElementById("cp-current-password").value;
+      const new_username = document.getElementById("cp-new-username").value.trim();
+      const new_password = document.getElementById("cp-new-password").value;
+      const errDiv = document.getElementById("cp-error");
+      const succDiv = document.getElementById("cp-success");
+      const btn = document.getElementById("btn-save-password");
+
+      btn.disabled = true;
+      btn.textContent = "Saving to D1...";
+      errDiv.style.display = "none";
+      succDiv.style.display = "none";
+
+      try {
+        const res = await fetch("/api/admin/change-password", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ current_password, new_username, new_password })
+        });
+        const data = await res.json();
+        if (data.success) {
+          succDiv.textContent = "✅ " + data.message;
+          succDiv.style.display = "block";
+          document.getElementById("admin-username-display").textContent = data.user || new_username;
+          setTimeout(() => {
+            closeChangePasswordModal();
+            alert("✅ Administrator credentials updated and secured!");
+          }, 1200);
+        } else {
+          errDiv.textContent = data.error || "Failed to update password";
+          errDiv.style.display = "block";
+        }
+      } catch (err) {
+        errDiv.textContent = "Network error updating password";
+        errDiv.style.display = "block";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Save Credentials";
+      }
     }
 
     function openLoginModal() {
@@ -1929,22 +2189,11 @@ Key Automation Tools:
         // Render Media Table
         renderMediaTable(data.media || []);
 
-        // Render Credentials Table
-        renderCredentialsTable(data.credentials || []);
+        // Render Platform Integration Hub Cards
+        renderPlatformCards(data.platformSummaries, data.oauthApps);
 
-        // Update OAuth Apps status
-        if (data.oauthApps) {
-          const liStatus = document.getElementById("badge-li-secret-status");
-          if (liStatus) {
-            if (data.oauthApps.linkedin.hasSecret) {
-              liStatus.className = "badge-status badge-published";
-              liStatus.textContent = "Secret: Saved in D1 ✅";
-            } else {
-              liStatus.className = "badge-status badge-failed";
-              liStatus.textContent = "Secret: Missing in D1 ⚠️";
-            }
-          }
-        }
+        // Render Credentials Table
+        renderCredentialsTable(data.credentials || [], data.oauthApps);
       } catch (err) {
         console.error("Error refreshing logs:", err);
       }
@@ -2021,7 +2270,99 @@ Key Automation Tools:
       }).join("");
     }
 
-    function renderCredentialsTable(creds) {
+    function renderPlatformCards(sums, oauthApps) {
+      sums = sums || {};
+      const li = sums.linkedin || { hasAppSecret: false, isConnected: false };
+      const gh = sums.github || { hasAppSecret: false, isConnected: false };
+
+      // 1. LinkedIn Card
+      const liCard = document.getElementById("card-linkedin");
+      const liBadge = document.getElementById("li-status-badge");
+      const liDesc = document.getElementById("li-status-desc");
+      const liActions = document.getElementById("li-actions");
+
+      if (liCard && liBadge && liDesc && liActions) {
+        if (li.isConnected) {
+          const name = li.extra?.name || "LinkedIn Member";
+          const urn = li.extra?.author_urn || "";
+          liCard.style.borderColor = "var(--green)";
+          liCard.style.background = "rgba(34, 197, 94, 0.08)";
+          liBadge.className = "badge-status badge-published";
+          liBadge.textContent = "CONNECTED & ACTIVE 🟢";
+          liDesc.innerHTML = 
+            '<div style="font-size: 0.95rem; font-weight: bold; color: var(--text); margin-bottom: 0.25rem;">👤 ' + escapeHtml(name) + '</div>' +
+            '<div style="font-size: 0.8rem; color: var(--text-muted);">' + (urn ? ('URN: <code>' + escapeHtml(urn) + '</code> &bull; ') : '') + '<span style="color: var(--green);">Ready for Muse AI Auto-Posting!</span></div>';
+          liActions.innerHTML = 
+            '<button class="btn btn-outline btn-sm" onclick="testConnection(\\'linkedin\\')" style="color: var(--green); border-color: var(--green);">🧪 Test</button>' +
+            '<a href="/auth/linkedin" class="btn btn-outline btn-sm" style="color: var(--blue); border-color: var(--blue); text-decoration: none;">🔄 Reconnect</a>' +
+            '<button class="btn btn-danger btn-sm" onclick="deleteCredential(\\'linkedin\\')">🗑️ Disconnect</button>';
+        } else if (li.hasAppSecret) {
+          liCard.style.borderColor = "#f59e0b";
+          liCard.style.background = "rgba(245, 158, 11, 0.08)";
+          liBadge.className = "badge-status badge-pending";
+          liBadge.textContent = "APP KEY SAVED • NOT LINKED YET ⚠️";
+          liDesc.innerHTML = 
+            '<div style="font-size: 0.88rem; color: #fde047; font-weight: 600; margin-bottom: 0.25rem;">✅ Developer App Secret is saved in D1!</div>' +
+            '<div style="font-size: 0.82rem; color: var(--text-muted); margin-bottom: 0.4rem;">👉 আপনার পার্সোনাল LinkedIn অ্যাকাউন্ট এখনো লিঙ্ক করা হয়নি। নিচের বাটনে ক্লিক করে ১-ক্লিকে লিঙ্কডইন অথরাইজ করুন:</div>';
+          liActions.innerHTML = 
+            '<a href="/auth/linkedin" class="btn btn-primary btn-sm" style="background: #0a66c2; text-decoration: none; font-weight: bold; font-size: 0.85rem; padding: 0.4rem 0.9rem;">🚀 Connect LinkedIn Profile (1-Click)</a>' +
+            '<button class="btn btn-outline btn-sm" onclick="connectPlatform(\\'linkedin\\')" style="color: var(--blue); border-color: var(--blue);">➕ Paste Token</button>';
+        } else {
+          liCard.style.borderColor = "var(--border)";
+          liCard.style.background = "rgba(10, 102, 194, 0.06)";
+          liBadge.className = "badge-status badge-failed";
+          liBadge.textContent = "NOT CONFIGURED ⚪";
+          liDesc.innerHTML = 
+            '<div style="font-size: 0.82rem; color: var(--text-muted);">Save your LinkedIn Developer App Secret below or paste an Access Token to enable posting.</div>';
+          liActions.innerHTML = 
+            '<button class="btn btn-primary btn-sm" onclick="focusOAuthApp(\\'linkedin\\')" style="background: #0a66c2;">⚙️ Setup App Secret</button>' +
+            '<button class="btn btn-outline btn-sm" onclick="connectPlatform(\\'linkedin\\')" style="color: var(--blue); border-color: var(--blue);">➕ Paste Token</button>';
+        }
+      }
+
+      // 2. GitHub Card
+      const ghCard = document.getElementById("card-github");
+      const ghBadge = document.getElementById("gh-status-badge");
+      const ghDesc = document.getElementById("gh-status-desc");
+      const ghActions = document.getElementById("gh-actions");
+
+      if (ghCard && ghBadge && ghDesc && ghActions) {
+        if (gh.isConnected) {
+          const login = gh.extra?.login || "user";
+          ghCard.style.borderColor = "var(--green)";
+          ghCard.style.background = "rgba(34, 197, 94, 0.08)";
+          ghBadge.className = "badge-status badge-published";
+          ghBadge.textContent = "CONNECTED & ACTIVE 🟢";
+          ghDesc.innerHTML = 
+            '<div style="font-size: 0.95rem; font-weight: bold; color: var(--text); margin-bottom: 0.25rem;">🐙 @' + escapeHtml(login) + '</div>' +
+            '<div style="font-size: 0.8rem; color: var(--text-muted);"><span style="color: var(--green);">Repository, Issue, and Gist automation active!</span></div>';
+          ghActions.innerHTML = 
+            '<button class="btn btn-outline btn-sm" onclick="testConnection(\\'github\\')" style="color: var(--green); border-color: var(--green);">🧪 Test</button>' +
+            '<button class="btn btn-danger btn-sm" onclick="deleteCredential(\\'github\\')">🗑️ Disconnect</button>';
+        } else {
+          ghCard.style.borderColor = "var(--border)";
+          ghCard.style.background = "rgba(147, 51, 234, 0.06)";
+          ghBadge.className = "badge-status badge-failed";
+          ghBadge.textContent = "NOT CONFIGURED ⚪";
+          ghDesc.innerHTML = 
+            '<div style="font-size: 0.82rem; color: var(--text-muted);">Connect GitHub with a PAT (repo, gist, read:user scopes) to manage code and issues.</div>';
+          ghActions.innerHTML = 
+            '<button class="btn btn-primary btn-sm" onclick="connectPlatform(\\'github\\')" style="background: #7e22ce;">➕ Set GitHub Token</button>' +
+            (gh.hasAppSecret ? '<a href="/auth/github" class="btn btn-outline btn-sm" style="color: #c084fc; border-color: #c084fc; text-decoration: none;">1-Click OAuth</a>' : '');
+        }
+      }
+    }
+
+    function focusOAuthApp(platform) {
+      const platSelect = document.getElementById("oauth-app-platform");
+      if (platSelect) {
+        platSelect.value = platform;
+        onOAuthAppPlatformChange();
+        platSelect.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    }
+
+    function renderCredentialsTable(creds, oauthApps) {
       const tbody = document.getElementById("credentials-table-body");
       
       const known = {
@@ -2057,6 +2398,17 @@ Key Automation Tools:
           } catch {}
         }
 
+        let appKeyStatus = '<span style="color: var(--text-muted); font-size: 0.75rem;">-</span>';
+        if (plat === "linkedin") {
+          appKeyStatus = (oauthApps && oauthApps.linkedin && oauthApps.linkedin.hasSecret)
+            ? '<span class="badge-status badge-published" style="font-size: 0.7rem;">Saved ✅</span>'
+            : '<span class="badge-status badge-failed" style="font-size: 0.7rem;">Missing ⚠️</span>';
+        } else if (plat === "github") {
+          appKeyStatus = (oauthApps && oauthApps.github && oauthApps.github.hasSecret)
+            ? '<span class="badge-status badge-published" style="font-size: 0.7rem;">Saved ✅</span>'
+            : '<span class="badge-status badge-failed" style="font-size: 0.7rem;">Missing ⚠️</span>';
+        }
+
         const actionHtml = configured
           ? '<div style="display: flex; gap: 0.35rem; align-items: center;">' +
             '<button class="btn btn-outline btn-sm" onclick="testConnection(\\'' + plat + '\\')" style="color: var(--green); border-color: var(--green); padding: 0.2rem 0.55rem; font-size: 0.78rem;" title="Test ' + plat + ' Connection">🧪 Test</button>' +
@@ -2069,9 +2421,10 @@ Key Automation Tools:
         return '<tr>' +
           '<td><strong>' + meta.icon + ' ' + meta.name + '</strong></td>' +
           '<td>' + detailsHtml + '</td>' +
+          '<td>' + appKeyStatus + '</td>' +
           '<td>' + (configured ? (item.token_type || "Bearer") : "-") + '</td>' +
           '<td style="font-size: 0.8rem; color: var(--text-muted);">' + (configured && item.updated_at ? item.updated_at : "Never") + '</td>' +
-          '<td><span class="badge-status ' + (configured ? "badge-published" : "badge-failed") + '">' + (configured ? "Connected" : "Not Configured") + '</span></td>' +
+          '<td><span class="badge-status ' + (configured ? "badge-published" : "badge-failed") + '">' + (configured ? "Active 🟢" : "Not Linked ⚪") + '</span></td>' +
           '<td>' + actionHtml + '</td>' +
         '</tr>';
       }).join("");

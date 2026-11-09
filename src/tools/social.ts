@@ -229,6 +229,20 @@ export async function executeSocialTool(
       }
 
       if (!authorUrn) {
+        try {
+          const meRes = await fetch("https://api.linkedin.com/v2/me", {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          if (meRes.ok) {
+            const meData = await meRes.json() as any;
+            if (meData.id) {
+              authorUrn = `urn:li:person:${meData.id}`;
+            }
+          }
+        } catch {}
+      }
+
+      if (!authorUrn) {
         authorUrn = "urn:li:person:me";
       }
 

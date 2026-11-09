@@ -241,18 +241,19 @@ export async function executeGeneralTool(
     case "crypto_utils": {
       const text = String(args.text || "");
       const algorithm = String(args.algorithm || "").toLowerCase();
-      if (algorithm === "base64_encode") {
+      const normAlgo = algorithm.replace(/[-_]/g, "");
+      if (normAlgo === "base64encode" || algorithm === "base64_encode" || algorithm === "base64") {
         return { content: [{ type: "text", text: btoa(unescape(encodeURIComponent(text))) }] };
       }
-      if (algorithm === "base64_decode") {
+      if (normAlgo === "base64decode" || algorithm === "base64_decode") {
         try {
           return { content: [{ type: "text", text: decodeURIComponent(escape(atob(text))) }] };
         } catch (e: any) {
           return { content: [{ type: "text", text: `Base64 decode error: ${e.message}` }], isError: true };
         }
       }
-      if (algorithm === "sha256" || algorithm === "sha512") {
-        const algoName = algorithm === "sha256" ? "SHA-256" : "SHA-512";
+      if (normAlgo === "sha256" || normAlgo === "sha512") {
+        const algoName = normAlgo === "sha256" ? "SHA-256" : "SHA-512";
         const msgBuffer = new TextEncoder().encode(text);
         const hashBuffer = await crypto.subtle.digest(algoName, msgBuffer);
         const hashArray = Array.from(new Uint8Array(hashBuffer));

@@ -110,13 +110,79 @@ export async function getOAuthAppConfig(
   return { clientId, clientSecret };
 }
 
+export const DEFAULT_MCP_KEY = "SOhag999@#";
+
+export async function getExpectedMCPKey(env: Env): Promise<string> {
+  if (env.DB) {
+    try {
+      const row: any = await env.DB.prepare(
+        "SELECT access_token FROM social_credentials WHERE platform = 'mcp_agent_key'"
+      ).first();
+      if (row && row.access_token && row.access_token.trim()) {
+        return row.access_token.trim();
+      }
+    } catch {}
+  }
+  if (env.MCP_API_KEY && env.MCP_API_KEY.trim()) {
+    return env.MCP_API_KEY.trim();
+  }
+  return DEFAULT_MCP_KEY;
+}
+
+export async function verifyMCPAgentAuth(
+  request: Request,
+  env: Env
+): Promise<{ authorized: boolean; token?: string; reason?: string }> {
+  const expectedKey = await getExpectedMCPKey(env);
+  if (!expectedKey) {
+    return { authorized: true };
+  }
+
+  const url = new URL(request.url);
+  const authHeader = request.headers.get("Authorization") || "";
+  const apiKeyHeader = request.headers.get("x-api-key") || request.headers.get("x-mcp-token") || "";
+  const tokenParam =
+    url.searchParams.get("token") ||
+    url.searchParams.get("key") ||
+    url.searchParams.get("apiKey") ||
+    "";
+
+  let provided = "";
+  if (authHeader.startsWith("Bearer ")) {
+    provided = authHeader.slice(7).trim();
+  } else if (authHeader) {
+    provided = authHeader.trim();
+  } else if (apiKeyHeader) {
+    provided = apiKeyHeader.trim();
+  } else if (tokenParam) {
+    provided = tokenParam.trim();
+  }
+
+  if (!provided) {
+    return {
+      authorized: false,
+      reason: "Missing MCP authentication token. Please provide the secret token in Authorization header ('Bearer <token>') or query parameter ('?token=<token>').",
+    };
+  }
+
+  const isMatch = provided === expectedKey || (expectedKey.endsWith("#") && provided === expectedKey.slice(0, -1));
+  if (!isMatch) {
+    return {
+      authorized: false,
+      reason: "Invalid MCP secret token. Access denied.",
+    };
+  }
+
+  return { authorized: true, token: provided };
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, x-mcp-version",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, x-mcp-version, x-api-key, x-mcp-token",
     };
 
     // CORS preflight
@@ -499,7 +565,11 @@ export default {
           }
         } catch {}
       }
-      return new Response(JSON.stringify({ authenticated: isValid, user: isValid ? username : null }), {
+      return new Response(JSON.stringify({
+        authenticated: isValid,
+        user: isValid ? username : null,
+        mcpToken: await getExpectedMCPKey(env),
+      }), {
         status: 200,
         headers: { "Content-Type": "application/json", ...corsHeaders },
       });
@@ -587,6 +657,59 @@ export default {
             "Set-Cookie": `mcp_session=${encodeURIComponent(newToken)}; Path=/; Max-Age=1209600; SameSite=Lax; Secure`,
             ...corsHeaders,
           },
+        }
+      );
+    }
+
+    // Update MCP Agent Secret Token: POST /api/admin/mcp-token
+    if (url.pathname === "/api/admin/mcp-token" && request.method === "POST") {
+      const token = extractToken(request);
+      const secret = env.JWT_SECRET || DEFAULT_SECRET;
+      const isValid = token ? await verifyToken(token, secret) : false;
+
+      if (!isValid) {
+        return new Response(JSON.stringify({ error: "Unauthorized. Please log in first." }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      if (!env.DB) {
+        return new Response(JSON.stringify({ error: "Database not connected" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      let body: any = {};
+      try { body = await request.json(); } catch {}
+      const newMCPToken = String(body.token || "").trim();
+
+      if (!newMCPToken) {
+        return new Response(JSON.stringify({ error: "Token cannot be empty." }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      const now = new Date().toISOString();
+      await env.DB.prepare(`
+        INSERT INTO social_credentials (platform, access_token, token_type, extra_data, updated_at)
+        VALUES ('mcp_agent_key', ?, 'Bearer', '{"name":"MCP Agent Secret"}', ?)
+        ON CONFLICT(platform) DO UPDATE SET
+          access_token = excluded.access_token,
+          updated_at = excluded.updated_at
+      `).bind(newMCPToken, now).run();
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          message: "MCP Agent Secret Token updated successfully!",
+          mcpToken: newMCPToken,
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
         }
       );
     }
@@ -1177,7 +1300,7 @@ export default {
 
           const credRows = await env.DB.prepare("SELECT platform, token_type, expires_at, extra_data, updated_at FROM social_credentials").all();
           const allCreds = credRows.results || [];
-          credentials = allCreds.filter((c: any) => !c.platform.endsWith("_oauth_app") && c.platform !== "admin_auth");
+          credentials = allCreds.filter((c: any) => !c.platform.endsWith("_oauth_app") && c.platform !== "admin_auth" && c.platform !== "mcp_agent_key");
 
           // Compute stats
           stats.totalPosts = posts.length;
@@ -1256,6 +1379,7 @@ export default {
           credentials,
           oauthApps,
           platformSummaries,
+          mcpToken: await getExpectedMCPKey(env),
           timestamp: new Date().toISOString(),
         }),
         {
@@ -1267,7 +1391,24 @@ export default {
 
     // MCP Streamable HTTP JSON-RPC endpoint
     if (url.pathname === "/mcp" || url.pathname === "/api/mcp") {
-      return handleMCPRequest(request, env as any);
+      const auth = await verifyMCPAgentAuth(request, env);
+      if (!auth.authorized) {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: null,
+            error: {
+              code: -32000,
+              message: `Unauthorized: ${auth.reason}`,
+            },
+          }),
+          {
+            status: 401,
+            headers: { "Content-Type": "application/json", ...corsHeaders },
+          }
+        );
+      }
+      return handleMCPRequest(request, { ...env, MCP_API_KEY: await getExpectedMCPKey(env) } as any);
     }
 
     // Health check endpoint
@@ -1277,9 +1418,10 @@ export default {
           status: "healthy",
           server: "cloudflare-mcp",
           domain: "mcp.sohag.com.bd",
-          version: "2.1.0",
+          version: "2.2.0",
           timestamp: new Date().toISOString(),
           toolsCount: TOOLS.length,
+          mcpAuth: "Protected (Secret Token Required)",
           bindings: {
             d1: !!env.DB,
             r2: !!env.MEDIA_BUCKET,
@@ -1303,8 +1445,23 @@ export default {
 
     // SSE endpoint
     if (url.pathname === "/sse") {
+      const auth = await verifyMCPAgentAuth(request, env);
+      if (!auth.authorized) {
+        return new Response(
+          JSON.stringify({
+            error: "Unauthorized",
+            message: auth.reason,
+            hint: "Connect with ?token=SOhag999@# or Header 'Authorization: Bearer SOhag999@#'",
+          }),
+          {
+            status: 401,
+            headers: { "Content-Type": "application/json", ...corsHeaders },
+          }
+        );
+      }
+
       const sessionId = crypto.randomUUID();
-      const messageEndpoint = `${url.origin}/message?sessionId=${sessionId}`;
+      const messageEndpoint = `${url.origin}/message?sessionId=${sessionId}&token=${encodeURIComponent(auth.token || "")}`;
 
       const stream = new ReadableStream({
         start(controller) {
@@ -1327,16 +1484,51 @@ export default {
     }
 
     if (url.pathname === "/message") {
-      return handleMCPRequest(request, env as any);
+      const auth = await verifyMCPAgentAuth(request, env);
+      if (!auth.authorized) {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: null,
+            error: {
+              code: -32000,
+              message: `Unauthorized: ${auth.reason}`,
+            },
+          }),
+          {
+            status: 401,
+            headers: { "Content-Type": "application/json", ...corsHeaders },
+          }
+        );
+      }
+      return handleMCPRequest(request, { ...env, MCP_API_KEY: await getExpectedMCPKey(env) } as any);
     }
 
     if (request.method === "POST" && url.pathname === "/") {
-      return handleMCPRequest(request, env as any);
+      const auth = await verifyMCPAgentAuth(request, env);
+      if (!auth.authorized) {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: null,
+            error: {
+              code: -32000,
+              message: `Unauthorized: ${auth.reason}`,
+            },
+          }),
+          {
+            status: 401,
+            headers: { "Content-Type": "application/json", ...corsHeaders },
+          }
+        );
+      }
+      return handleMCPRequest(request, { ...env, MCP_API_KEY: await getExpectedMCPKey(env) } as any);
     }
 
     // Landing Dashboard (GET /)
     const cf = (request as any).cf || {};
-    return new Response(renderDashboard(url.origin, cf, env), {
+    const expectedMCPKey = await getExpectedMCPKey(env);
+    return new Response(renderDashboard(url.origin, cf, env, expectedMCPKey), {
       status: 200,
       headers: {
         "Content-Type": "text/html; charset=utf-8",
@@ -1346,7 +1538,7 @@ export default {
   },
 };
 
-function renderDashboard(origin: string, cf: any, env: Env): string {
+function renderDashboard(origin: string, cf: any, env: Env, mcpToken: string = DEFAULT_MCP_KEY): string {
   const mcpEndpoint = `${origin}/mcp`;
   const sseEndpoint = `${origin}/sse`;
 
@@ -1772,6 +1964,34 @@ function renderDashboard(origin: string, cf: any, env: Env): string {
             </div>
           </div>
 
+          <!-- AI Agent MCP Secret Token Configuration -->
+          <div style="background: rgba(14, 21, 36, 0.95); border: 1px solid rgba(34, 197, 94, 0.4); border-radius: 10px; padding: 1.25rem; margin-bottom: 1.5rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; flex-wrap: wrap; gap: 0.5rem;">
+              <h4 style="margin: 0; color: #22c55e; font-size: 1rem; display: flex; align-items: center; gap: 0.4rem;">
+                <span>🤖</span> AI Agent MCP Secret Key (Muse AI &amp; External Agents)
+              </h4>
+              <span style="font-size: 0.78rem; color: var(--green); font-weight: 600;">🔒 Required for /mcp, /sse, and /message</span>
+            </div>
+            <p style="font-size: 0.82rem; color: var(--text-muted); margin-bottom: 1rem;">
+              When external AI agents (like <strong>Muse AI</strong> or Cursor) connect, they <strong>must</strong> provide this Secret Token. You can update it here directly into Cloudflare D1:
+            </p>
+            <form onsubmit="handleMCPTokenSubmit(event)" style="display: flex; gap: 0.85rem; align-items: flex-end; flex-wrap: wrap;">
+              <div class="form-group" style="margin-bottom: 0; flex: 1; min-width: 250px;">
+                <label style="font-size: 0.78rem; color: var(--text-muted); display: block; margin-bottom: 0.25rem;">Active MCP Secret Token</label>
+                <input type="text" id="admin-mcp-token-input" class="form-control" value="${mcpToken}" required style="font-family: monospace; font-weight: bold; color: #38bdf8;">
+              </div>
+              <div style="display: flex; gap: 0.5rem;">
+                <button type="button" class="btn btn-outline btn-sm" onclick="navigator.clipboard.writeText(document.getElementById('admin-mcp-token-input').value); alert('✅ Copied MCP Secret Token to clipboard!')" style="height: 36px; padding: 0 0.9rem;">
+                  📋 Copy Token
+                </button>
+                <button type="submit" id="btn-save-mcp-token" class="btn btn-primary btn-sm" style="height: 36px; background: #22c55e; border-color: #22c55e; padding: 0 1rem;">
+                  💾 Save MCP Token to D1
+                </button>
+              </div>
+            </form>
+            <div id="mcp-token-status-msg" style="font-size: 0.82rem; margin-top: 0.6rem; display: none;"></div>
+          </div>
+
           <!-- OAuth Developer App Config (Save Secret to D1 without terminal) -->
           <div style="background: rgba(14, 21, 36, 0.95); border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 10px; padding: 1.25rem; margin-bottom: 1.5rem;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; flex-wrap: wrap; gap: 0.5rem;">
@@ -1906,16 +2126,42 @@ function renderDashboard(origin: string, cf: any, env: Env): string {
     <!-- PUBLIC MCP CONNECTION & INFO SECTION -->
     <div class="grid">
       <div class="card">
-        <h2>🔌 Connect with AI Agents (Muse AI)</h2>
-        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.4rem;">Streamable HTTP Endpoint (Recommended):</p>
-        <div class="url-box">
-          <span>${mcpEndpoint}</span>
-          <button class="copy-btn" onclick="navigator.clipboard.writeText('${mcpEndpoint}')">Copy</button>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; flex-wrap: wrap; gap: 0.5rem;">
+          <h2 style="margin: 0; font-size: 1.15rem;">🔌 Connect AI Agents (Muse AI, Cursor)</h2>
+          <span style="background: rgba(34, 197, 94, 0.15); border: 1px solid var(--green); color: var(--green); font-size: 0.72rem; font-weight: bold; padding: 0.2rem 0.5rem; border-radius: 4px;">🔒 PROTECTED WITH SECRET TOKEN</span>
         </div>
-        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.4rem;">SSE Endpoint:</p>
-        <div class="url-box">
-          <span>${sseEndpoint}</span>
-          <button class="copy-btn" onclick="navigator.clipboard.writeText('${sseEndpoint}')">Copy</button>
+        
+        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+          <strong>Streamable HTTP Endpoint</strong> (with Secret Token &mdash; recommended for Muse AI):
+        </p>
+        <div class="url-box" style="margin-bottom: 0.75rem;">
+          <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${mcpEndpoint}?token=${mcpToken}</span>
+          <button class="copy-btn" onclick="navigator.clipboard.writeText('${mcpEndpoint}?token=${mcpToken}')">Copy URL</button>
+        </div>
+
+        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+          <strong>SSE Endpoint</strong> (with Secret Token &mdash; for Claude Desktop / SSE clients):
+        </p>
+        <div class="url-box" style="margin-bottom: 0.75rem;">
+          <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${sseEndpoint}?token=${mcpToken}</span>
+          <button class="copy-btn" onclick="navigator.clipboard.writeText('${sseEndpoint}?token=${mcpToken}')">Copy SSE</button>
+        </div>
+
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.5rem; margin-top: 0.5rem;">
+          <div style="background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.75rem;">
+            <div style="font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase;">Agent Secret Token:</div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 0.2rem;">
+              <code style="color: #38bdf8; font-weight: bold;">${mcpToken}</code>
+              <button class="btn btn-outline btn-sm" style="padding: 0.15rem 0.5rem; font-size: 0.72rem;" onclick="navigator.clipboard.writeText('${mcpToken}')">Copy</button>
+            </div>
+          </div>
+          <div style="background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.75rem;">
+            <div style="font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase;">HTTP Auth Header:</div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 0.2rem;">
+              <code style="color: #22c55e; font-size: 0.75rem;">Bearer ${mcpToken}</code>
+              <button class="btn btn-outline btn-sm" style="padding: 0.15rem 0.5rem; font-size: 0.72rem;" onclick="navigator.clipboard.writeText('Bearer ${mcpToken}')">Copy</button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -1933,23 +2179,47 @@ function renderDashboard(origin: string, cf: any, env: Env): string {
 
     <!-- Muse AI instructions -->
     <div class="card" style="margin-bottom: 2rem;">
-      <h2>🤖 Muse AI Quick Connection Guide</h2>
-      <p style="font-size: 0.9rem; color: var(--text-muted); margin-bottom: 0.75rem;">
-        In Muse AI or any MCP-compatible agent, add a Remote MCP tool using this endpoint:
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; flex-wrap: wrap; gap: 0.5rem;">
+        <h2 style="margin: 0; font-size: 1.15rem;">🤖 Muse AI Quick Connection Guide</h2>
+        <span style="font-size: 0.8rem; color: var(--text-muted);">Transport: Streamable HTTP / JSON-RPC 2.0</span>
+      </div>
+      <p style="font-size: 0.88rem; color: var(--text-muted); margin-bottom: 0.75rem;">
+        In <strong>Muse AI</strong> or any MCP client (Cursor, Claude Desktop, Windsurf), connect using either the Tokenized URL or Bearer Header:
       </p>
-      <pre><code>Server URL: ${mcpEndpoint}
-Transport: HTTP POST (Streamable HTTP / JSON-RPC 2.0)
-Key Automation Tools:
-- github_get_user         → Fetches authenticated GitHub profile and repository stats
-- github_list_repositories→ Lists public & private repositories with sorting and filters
-- github_create_issue     → Opens new issues in GitHub repos and records in D1
-- github_create_gist      → Creates public or secret code Gists and records in D1
-- github_create_or_update_file → Directly commits or updates files in GitHub repositories
-- linkedin_publish_post   → Publishes posts/articles to LinkedIn and saves logs in D1
-- youtube_upload_video    → Uploads videos stored in R2 directly to YouTube
-- youtube_reply_comment   → Replies to YouTube comments
-- db_get_post_logs        → Muse AI can check recent post logs and approval status
-- r2_upload_file          → Uploads media assets to https://mcp.sohag.com.bd/media/...</code></pre>
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 1rem; margin-bottom: 1rem;">
+        <div style="background: rgba(0,0,0,0.35); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 8px; padding: 1rem;">
+          <div style="font-weight: 600; color: #38bdf8; margin-bottom: 0.5rem; font-size: 0.88rem;">Option 1: Direct URL in Muse AI (Easiest)</div>
+          <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.5rem;">Paste this complete URL into Muse AI's Remote MCP URL field:</p>
+          <pre style="margin: 0; padding: 0.6rem; font-size: 0.82rem; background: #06090e; overflow-x: auto;"><code>${mcpEndpoint}?token=${mcpToken}</code></pre>
+        </div>
+        <div style="background: rgba(0,0,0,0.35); border: 1px solid rgba(34, 197, 94, 0.25); border-radius: 8px; padding: 1rem;">
+          <div style="font-weight: 600; color: #22c55e; margin-bottom: 0.5rem; font-size: 0.88rem;">Option 2: Config JSON (Cursor / Claude)</div>
+          <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.5rem;">Add to your mcpServers JSON configuration:</p>
+          <pre style="margin: 0; padding: 0.6rem; font-size: 0.76rem; background: #06090e; overflow-x: auto;"><code>{
+  "mcpServers": {
+    "cloudflare-mcp": {
+      "url": "${mcpEndpoint}?token=${mcpToken}",
+      "headers": {
+        "Authorization": "Bearer ${mcpToken}"
+      }
+    }
+  }
+}</code></pre>
+        </div>
+      </div>
+      <div style="font-size: 0.85rem; color: var(--text-muted);">
+        <strong style="color: var(--accent);">Key Active Tools Ready for Muse AI:</strong>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 0.4rem; margin-top: 0.5rem; font-size: 0.8rem;">
+          <div>🔗 <code>linkedin_publish_post</code> &mdash; Auto-post to LinkedIn</div>
+          <div>🐙 <code>github_create_issue</code> &mdash; Create GitHub issues</div>
+          <div>🐙 <code>github_create_gist</code> &mdash; Create Gists</div>
+          <div>🐙 <code>github_create_or_update_file</code> &mdash; Commit files</div>
+          <div>📹 <code>youtube_upload_video</code> &mdash; Publish YouTube videos</div>
+          <div>💬 <code>youtube_reply_comment</code> &mdash; Reply to comments</div>
+          <div>🗄️ <code>db_get_post_logs</code> &mdash; Check status in D1</div>
+          <div>📦 <code>r2_upload_file</code> &mdash; Upload media to R2</div>
+        </div>
+      </div>
     </div>
 
     <!-- Tools Catalog -->
@@ -2194,12 +2464,21 @@ Key Automation Tools:
 
         // Render Credentials Table
         renderCredentialsTable(data.credentials || [], data.oauthApps);
+
+        if (data.mcpToken) {
+          const mcpInput = document.getElementById("admin-mcp-token-input");
+          if (mcpInput && document.activeElement !== mcpInput) {
+            mcpInput.value = data.mcpToken;
+          }
+        }
       } catch (err) {
         console.error("Error refreshing logs:", err);
       }
     }
 
+    let _cachedPosts = [];
     function renderPostsTable(posts) {
+      _cachedPosts = posts || [];
       const tbody = document.getElementById("posts-table-body");
       if (posts.length === 0) {
         tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted);">No posts recorded in D1 yet.</td></tr>';
@@ -2217,7 +2496,6 @@ Key Automation Tools:
           mediaLink = '<a href="' + p.media_urls + '" target="_blank" style="color: var(--blue);">' + linkText + '</a>';
         }
 
-        const rawResponse = p.response_data ? JSON.stringify(JSON.parse(p.response_data), null, 2) : "None";
         const contentSnippet = (p.content || "").length > 80 ? (p.content.substring(0, 80) + "...") : p.content;
 
         return '<tr>' +
@@ -2227,9 +2505,21 @@ Key Automation Tools:
           '<td>' + mediaLink + '</td>' +
           '<td><span class="badge-status ' + badgeClass + '">' + p.status + '</span></td>' +
           '<td style="font-size: 0.8rem; color: var(--text-muted);">' + (p.published_at || p.created_at || "-") + '</td>' +
-          '<td><button class="btn btn-outline btn-sm" onclick=\\'alert(' + JSON.stringify(rawResponse) + ')\\'>View Details</button></td>' +
+          '<td><button class="btn btn-outline btn-sm" onclick="showPostDetails(' + p.id + ')">View Details</button></td>' +
         '</tr>';
       }).join("");
+    }
+
+    function showPostDetails(id) {
+      const p = _cachedPosts.find(x => x.id === id);
+      if (!p) return;
+      let resp = "No raw response";
+      try {
+        resp = p.response_data ? JSON.stringify(JSON.parse(p.response_data), null, 2) : "None";
+      } catch {
+        resp = p.response_data || "None";
+      }
+      alert("Post #" + p.id + " Details:\\n\\nPlatform: " + p.platform + "\\nStatus: " + p.status + "\\n\\nResponse:\\n" + resp);
     }
 
     function renderCommentsTable(comments) {
@@ -2265,9 +2555,14 @@ Key Automation Tools:
           '<td>' + sizeKb + '</td>' +
           '<td style="font-size: 0.8rem; color: var(--text-muted);">' + (m.uploaded ? new Date(m.uploaded).toLocaleString() : "-") + '</td>' +
           '<td><a href="' + m.url + '" target="_blank" style="color: var(--blue); word-break: break-all;">' + m.url + '</a></td>' +
-          '<td><button class="btn btn-outline btn-sm" onclick="navigator.clipboard.writeText(\\'' + m.url + '\\'); alert(\\'URL copied!\\')">Copy Link</button></td>' +
+          '<td><button class="btn btn-outline btn-sm" data-url="' + escapeHtml(m.url) + '" onclick="copyMediaUrl(this.dataset.url)">Copy Link</button></td>' +
         '</tr>';
       }).join("");
+    }
+
+    function copyMediaUrl(url) {
+      navigator.clipboard.writeText(url);
+      alert("Media URL copied to clipboard!");
     }
 
     function renderPlatformCards(sums, oauthApps) {
@@ -2291,11 +2586,12 @@ Key Automation Tools:
           liBadge.textContent = "CONNECTED & ACTIVE 🟢";
           liDesc.innerHTML = 
             '<div style="font-size: 0.95rem; font-weight: bold; color: var(--text); margin-bottom: 0.25rem;">👤 ' + escapeHtml(name) + '</div>' +
-            '<div style="font-size: 0.8rem; color: var(--text-muted);">' + (urn ? ('URN: <code>' + escapeHtml(urn) + '</code> &bull; ') : '') + '<span style="color: var(--green);">Ready for Muse AI Auto-Posting!</span></div>';
+            '<div style="font-size: 0.8rem; color: var(--text-muted);">' + (urn ? ('URN: <code>' + escapeHtml(urn) + '</code> &bull; ') : '') + '<span style="color: var(--green);">Ready for Muse AI Auto-Posting!</span></div>' +
+            '<div style="font-size: 0.76rem; color: #38bdf8; margin-top: 0.4rem; padding-top: 0.35rem; border-top: 1px dashed rgba(56, 189, 248, 0.25);">💡 Access Token সক্রিয় আছে। আপনার লিঙ্কডইন রেডি! (🔄 Reconnect শুধুমাত্র ১-ক্লিক OAuth রিনিউ করতে ব্যবহার করবেন)</div>';
           liActions.innerHTML = 
-            '<button class="btn btn-outline btn-sm" onclick="testConnection(\\'linkedin\\')" style="color: var(--green); border-color: var(--green);">🧪 Test</button>' +
+            '<button class="btn btn-outline btn-sm" data-platform="linkedin" onclick="testConnection(this.dataset.platform)" style="color: var(--green); border-color: var(--green);">🧪 Test</button>' +
             '<a href="/auth/linkedin" class="btn btn-outline btn-sm" style="color: var(--blue); border-color: var(--blue); text-decoration: none;">🔄 Reconnect</a>' +
-            '<button class="btn btn-danger btn-sm" onclick="deleteCredential(\\'linkedin\\')">🗑️ Disconnect</button>';
+            '<button class="btn btn-danger btn-sm" data-platform="linkedin" onclick="deleteCredential(this.dataset.platform)">🗑️ Disconnect</button>';
         } else if (li.hasAppSecret) {
           liCard.style.borderColor = "#f59e0b";
           liCard.style.background = "rgba(245, 158, 11, 0.08)";
@@ -2306,7 +2602,7 @@ Key Automation Tools:
             '<div style="font-size: 0.82rem; color: var(--text-muted); margin-bottom: 0.4rem;">👉 আপনার পার্সোনাল LinkedIn অ্যাকাউন্ট এখনো লিঙ্ক করা হয়নি। নিচের বাটনে ক্লিক করে ১-ক্লিকে লিঙ্কডইন অথরাইজ করুন:</div>';
           liActions.innerHTML = 
             '<a href="/auth/linkedin" class="btn btn-primary btn-sm" style="background: #0a66c2; text-decoration: none; font-weight: bold; font-size: 0.85rem; padding: 0.4rem 0.9rem;">🚀 Connect LinkedIn Profile (1-Click)</a>' +
-            '<button class="btn btn-outline btn-sm" onclick="connectPlatform(\\'linkedin\\')" style="color: var(--blue); border-color: var(--blue);">➕ Paste Token</button>';
+            '<button class="btn btn-outline btn-sm" data-platform="linkedin" onclick="connectPlatform(this.dataset.platform)" style="color: var(--blue); border-color: var(--blue);">➕ Paste Token</button>';
         } else {
           liCard.style.borderColor = "var(--border)";
           liCard.style.background = "rgba(10, 102, 194, 0.06)";
@@ -2315,8 +2611,8 @@ Key Automation Tools:
           liDesc.innerHTML = 
             '<div style="font-size: 0.82rem; color: var(--text-muted);">Save your LinkedIn Developer App Secret below or paste an Access Token to enable posting.</div>';
           liActions.innerHTML = 
-            '<button class="btn btn-primary btn-sm" onclick="focusOAuthApp(\\'linkedin\\')" style="background: #0a66c2;">⚙️ Setup App Secret</button>' +
-            '<button class="btn btn-outline btn-sm" onclick="connectPlatform(\\'linkedin\\')" style="color: var(--blue); border-color: var(--blue);">➕ Paste Token</button>';
+            '<button class="btn btn-primary btn-sm" data-platform="linkedin" onclick="focusOAuthApp(this.dataset.platform)" style="background: #0a66c2;">⚙️ Setup App Secret</button>' +
+            '<button class="btn btn-outline btn-sm" data-platform="linkedin" onclick="connectPlatform(this.dataset.platform)" style="color: var(--blue); border-color: var(--blue);">➕ Paste Token</button>';
         }
       }
 
@@ -2337,8 +2633,8 @@ Key Automation Tools:
             '<div style="font-size: 0.95rem; font-weight: bold; color: var(--text); margin-bottom: 0.25rem;">🐙 @' + escapeHtml(login) + '</div>' +
             '<div style="font-size: 0.8rem; color: var(--text-muted);"><span style="color: var(--green);">Repository, Issue, and Gist automation active!</span></div>';
           ghActions.innerHTML = 
-            '<button class="btn btn-outline btn-sm" onclick="testConnection(\\'github\\')" style="color: var(--green); border-color: var(--green);">🧪 Test</button>' +
-            '<button class="btn btn-danger btn-sm" onclick="deleteCredential(\\'github\\')">🗑️ Disconnect</button>';
+            '<button class="btn btn-outline btn-sm" data-platform="github" onclick="testConnection(this.dataset.platform)" style="color: var(--green); border-color: var(--green);">🧪 Test</button>' +
+            '<button class="btn btn-danger btn-sm" data-platform="github" onclick="deleteCredential(this.dataset.platform)">🗑️ Disconnect</button>';
         } else {
           ghCard.style.borderColor = "var(--border)";
           ghCard.style.background = "rgba(147, 51, 234, 0.06)";
@@ -2347,7 +2643,7 @@ Key Automation Tools:
           ghDesc.innerHTML = 
             '<div style="font-size: 0.82rem; color: var(--text-muted);">Connect GitHub with a PAT (repo, gist, read:user scopes) to manage code and issues.</div>';
           ghActions.innerHTML = 
-            '<button class="btn btn-primary btn-sm" onclick="connectPlatform(\\'github\\')" style="background: #7e22ce;">➕ Set GitHub Token</button>' +
+            '<button class="btn btn-primary btn-sm" data-platform="github" onclick="connectPlatform(this.dataset.platform)" style="background: #7e22ce;">➕ Set GitHub Token</button>' +
             (gh.hasAppSecret ? '<a href="/auth/github" class="btn btn-outline btn-sm" style="color: #c084fc; border-color: #c084fc; text-decoration: none;">1-Click OAuth</a>' : '');
         }
       }
@@ -2411,11 +2707,11 @@ Key Automation Tools:
 
         const actionHtml = configured
           ? '<div style="display: flex; gap: 0.35rem; align-items: center;">' +
-            '<button class="btn btn-outline btn-sm" onclick="testConnection(\\'' + plat + '\\')" style="color: var(--green); border-color: var(--green); padding: 0.2rem 0.55rem; font-size: 0.78rem;" title="Test ' + plat + ' Connection">🧪 Test</button>' +
-            '<button class="btn btn-danger btn-sm" onclick="deleteCredential(\\'' + plat + '\\')" style="padding: 0.2rem 0.5rem; font-size: 0.78rem;" title="Delete ' + plat + ' credentials">🗑️</button>' +
+            '<button class="btn btn-outline btn-sm" data-platform="' + plat + '" onclick="testConnection(this.dataset.platform)" style="color: var(--green); border-color: var(--green); padding: 0.2rem 0.55rem; font-size: 0.78rem;" title="Test ' + plat + ' Connection">🧪 Test</button>' +
+            '<button class="btn btn-danger btn-sm" data-platform="' + plat + '" onclick="deleteCredential(this.dataset.platform)" style="padding: 0.2rem 0.5rem; font-size: 0.78rem;" title="Delete ' + plat + ' credentials">🗑️</button>' +
             '</div>'
           : '<div style="display: flex; gap: 0.35rem; align-items: center;">' +
-            '<button class="btn btn-outline btn-sm" onclick="connectPlatform(\\'' + plat + '\\')" style="color: var(--blue); border-color: var(--blue); padding: 0.2rem 0.55rem; font-size: 0.78rem;" title="Connect ' + plat + '">➕ Connect</button>' +
+            '<button class="btn btn-outline btn-sm" data-platform="' + plat + '" onclick="connectPlatform(this.dataset.platform)" style="color: var(--blue); border-color: var(--blue); padding: 0.2rem 0.55rem; font-size: 0.78rem;" title="Connect ' + plat + '">➕ Connect</button>' +
             '</div>';
 
         return '<tr>' +
@@ -2559,6 +2855,47 @@ Key Automation Tools:
       } finally {
         btn.disabled = false;
         btn.textContent = "💾 Save Credentials to Cloudflare D1";
+      }
+    }
+
+    async function handleMCPTokenSubmit(e) {
+      e.preventDefault();
+      const token = document.getElementById("admin-mcp-token-input").value.trim();
+      const msgDiv = document.getElementById("mcp-token-status-msg");
+      const btn = document.getElementById("btn-save-mcp-token");
+
+      if (!token) {
+        alert("MCP Secret Token cannot be empty!");
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = "Saving...";
+      msgDiv.style.display = "block";
+      msgDiv.style.color = "var(--yellow)";
+      msgDiv.textContent = "⏳ Updating Agent MCP Secret Token in Cloudflare D1...";
+
+      try {
+        const res = await fetch("/api/admin/mcp-token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token })
+        });
+        const data = await res.json();
+        if (data.success) {
+          msgDiv.style.color = "var(--green)";
+          msgDiv.innerHTML = "<strong>✅ " + data.message + "</strong> External AI agents must now use: <code>" + escapeHtml(data.mcpToken) + "</code>";
+          setTimeout(() => { refreshAdminLogs(); }, 1000);
+        } else {
+          msgDiv.style.color = "var(--red)";
+          msgDiv.textContent = "❌ " + (data.error || "Failed to update MCP Token");
+        }
+      } catch (err) {
+        msgDiv.style.color = "var(--red)";
+        msgDiv.textContent = "❌ Network error updating MCP Token: " + err.message;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "💾 Save MCP Token to D1";
       }
     }
 

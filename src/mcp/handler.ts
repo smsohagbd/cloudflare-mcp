@@ -47,7 +47,7 @@ export async function handleMCPRequest(
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, x-mcp-version",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, x-mcp-version, x-api-key, x-mcp-token",
   };
 
   if (request.method === "OPTIONS") {
@@ -61,22 +61,41 @@ export async function handleMCPRequest(
     });
   }
 
-  // Optional API key authentication if MCP_API_KEY is configured in environment
-  if (env.MCP_API_KEY) {
+  // Secret token authentication for external AI agents (Muse AI, Claude Desktop, Cursor)
+  const expectedKey = env.MCP_API_KEY || "SOhag999@#";
+  if (expectedKey) {
     const authHeader = request.headers.get("Authorization") || "";
-    const apiKeyHeader = request.headers.get("x-api-key") || "";
+    const apiKeyHeader = request.headers.get("x-api-key") || request.headers.get("x-mcp-token") || "";
     const url = new URL(request.url);
-    const tokenParam = url.searchParams.get("key") || url.searchParams.get("token") || "";
+    const tokenParam =
+      url.searchParams.get("token") ||
+      url.searchParams.get("key") ||
+      url.searchParams.get("apiKey") ||
+      "";
 
-    const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : authHeader;
-    const provided = bearerToken || apiKeyHeader || tokenParam;
+    let provided = "";
+    if (authHeader.startsWith("Bearer ")) {
+      provided = authHeader.slice(7).trim();
+    } else if (authHeader) {
+      provided = authHeader.trim();
+    } else if (apiKeyHeader) {
+      provided = apiKeyHeader.trim();
+    } else if (tokenParam) {
+      provided = tokenParam.trim();
+    }
 
-    if (provided !== env.MCP_API_KEY) {
+    const matchesKey = provided === expectedKey || (expectedKey.endsWith("#") && provided === expectedKey.slice(0, -1));
+    if (!matchesKey) {
       return new Response(
         JSON.stringify({
           jsonrpc: "2.0",
           id: null,
-          error: { code: -32000, message: "Unauthorized: Invalid or missing API key" },
+          error: {
+            code: -32000,
+            message: provided
+              ? "Unauthorized: Invalid MCP secret token."
+              : "Unauthorized: Missing MCP secret token. Connect with 'Authorization: Bearer SOhag999@#' or '?token=SOhag999@#'.",
+          },
         }),
         { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );

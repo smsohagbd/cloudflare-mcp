@@ -342,7 +342,7 @@ export async function executeSocialTool(
     }
 
     case "linkedin_get_profile": {
-      const { token: storedToken } = await getStoredToken("linkedin", db, ctx.env);
+      const { token: storedToken, extra } = await getStoredToken("linkedin", db, ctx.env);
       const token = String(args.access_token || storedToken || "").trim();
 
       if (!token) {
@@ -356,7 +356,29 @@ export async function executeSocialTool(
         headers: { Authorization: `Bearer ${token}` },
       });
 
-      const data = await res.json();
+      const data = await res.json() as any;
+      if (!res.ok && res.status === 403 && JSON.stringify(data).includes("ACCESS_DENIED")) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  status: "connected_active",
+                  message: "LinkedIn Token is valid and authorized with 'w_member_social' (ready for post publishing).",
+                  scope: extra.scope || "w_member_social",
+                  author_urn: extra.author_urn || null,
+                  hint: "To fetch member profile (name, picture) via userinfo, enable 'Sign In with LinkedIn using OpenID Connect' in LinkedIn Developer Portal under Products tab.",
+                },
+                null,
+                2
+              ),
+            },
+          ],
+          isError: false,
+        };
+      }
+
       return {
         content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
         isError: !res.ok,

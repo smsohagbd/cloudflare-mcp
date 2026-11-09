@@ -568,7 +568,7 @@ export default {
       return new Response(JSON.stringify({
         authenticated: isValid,
         user: isValid ? username : null,
-        mcpToken: await getExpectedMCPKey(env),
+        mcpToken: isValid ? await getExpectedMCPKey(env) : undefined,
       }), {
         status: 200,
         headers: { "Content-Type": "application/json", ...corsHeaders },
@@ -1527,8 +1527,7 @@ export default {
 
     // Landing Dashboard (GET /)
     const cf = (request as any).cf || {};
-    const expectedMCPKey = await getExpectedMCPKey(env);
-    return new Response(renderDashboard(url.origin, cf, env, expectedMCPKey), {
+    return new Response(renderDashboard(url.origin, cf, env), {
       status: 200,
       headers: {
         "Content-Type": "text/html; charset=utf-8",
@@ -1538,7 +1537,7 @@ export default {
   },
 };
 
-function renderDashboard(origin: string, cf: any, env: Env, mcpToken: string = DEFAULT_MCP_KEY): string {
+function renderDashboard(origin: string, cf: any, env: Env): string {
   const mcpEndpoint = `${origin}/mcp`;
   const sseEndpoint = `${origin}/sse`;
 
@@ -1978,10 +1977,13 @@ function renderDashboard(origin: string, cf: any, env: Env, mcpToken: string = D
             <form onsubmit="handleMCPTokenSubmit(event)" style="display: flex; gap: 0.85rem; align-items: flex-end; flex-wrap: wrap;">
               <div class="form-group" style="margin-bottom: 0; flex: 1; min-width: 250px;">
                 <label style="font-size: 0.78rem; color: var(--text-muted); display: block; margin-bottom: 0.25rem;">Active MCP Secret Token</label>
-                <input type="text" id="admin-mcp-token-input" class="form-control" value="${mcpToken}" required style="font-family: monospace; font-weight: bold; color: #38bdf8;">
+                <div style="display: flex; gap: 0.4rem;">
+                  <input type="password" id="admin-mcp-token-input" class="form-control" value="" placeholder="Login to load token..." required style="font-family: monospace; font-weight: bold; color: #38bdf8;">
+                  <button type="button" class="btn btn-outline btn-sm" onclick="toggleTokenVisibility('admin-mcp-token-input')" style="padding: 0 0.6rem;" title="Show/Hide Token">👁️</button>
+                </div>
               </div>
               <div style="display: flex; gap: 0.5rem;">
-                <button type="button" class="btn btn-outline btn-sm" onclick="navigator.clipboard.writeText(document.getElementById('admin-mcp-token-input').value); alert('✅ Copied MCP Secret Token to clipboard!')" style="height: 36px; padding: 0 0.9rem;">
+                <button type="button" class="btn btn-outline btn-sm" onclick="copyAdminMcpToken()" style="height: 36px; padding: 0 0.9rem;">
                   📋 Copy Token
                 </button>
                 <button type="submit" id="btn-save-mcp-token" class="btn btn-primary btn-sm" style="height: 36px; background: #22c55e; border-color: #22c55e; padding: 0 1rem;">
@@ -2135,31 +2137,31 @@ function renderDashboard(origin: string, cf: any, env: Env, mcpToken: string = D
           <strong>Streamable HTTP Endpoint</strong> (with Secret Token &mdash; recommended for Muse AI):
         </p>
         <div class="url-box" style="margin-bottom: 0.75rem;">
-          <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${mcpEndpoint}?token=${mcpToken}</span>
-          <button class="copy-btn" onclick="navigator.clipboard.writeText('${mcpEndpoint}?token=${mcpToken}')">Copy URL</button>
+          <span id="public-mcp-url" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${mcpEndpoint}?token=••••••••</span>
+          <button class="copy-btn" id="btn-copy-mcp-url" onclick="copyPublicMcpUrl()">Copy URL</button>
         </div>
 
         <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.3rem;">
           <strong>SSE Endpoint</strong> (with Secret Token &mdash; for Claude Desktop / SSE clients):
         </p>
         <div class="url-box" style="margin-bottom: 0.75rem;">
-          <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${sseEndpoint}?token=${mcpToken}</span>
-          <button class="copy-btn" onclick="navigator.clipboard.writeText('${sseEndpoint}?token=${mcpToken}')">Copy SSE</button>
+          <span id="public-sse-url" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${sseEndpoint}?token=••••••••</span>
+          <button class="copy-btn" id="btn-copy-sse-url" onclick="copyPublicSseUrl()">Copy SSE</button>
         </div>
 
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.5rem; margin-top: 0.5rem;">
           <div style="background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.75rem;">
             <div style="font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase;">Agent Secret Token:</div>
             <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 0.2rem;">
-              <code style="color: #38bdf8; font-weight: bold;">${mcpToken}</code>
-              <button class="btn btn-outline btn-sm" style="padding: 0.15rem 0.5rem; font-size: 0.72rem;" onclick="navigator.clipboard.writeText('${mcpToken}')">Copy</button>
+              <code id="public-mcp-token" style="color: var(--yellow);">🔒 Login to Reveal</code>
+              <button class="btn btn-outline btn-sm" id="btn-copy-mcp-token" style="padding: 0.15rem 0.5rem; font-size: 0.72rem;" onclick="copyPublicMcpToken()">Copy</button>
             </div>
           </div>
           <div style="background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.75rem;">
             <div style="font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase;">HTTP Auth Header:</div>
             <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 0.2rem;">
-              <code style="color: #22c55e; font-size: 0.75rem;">Bearer ${mcpToken}</code>
-              <button class="btn btn-outline btn-sm" style="padding: 0.15rem 0.5rem; font-size: 0.72rem;" onclick="navigator.clipboard.writeText('Bearer ${mcpToken}')">Copy</button>
+              <code id="public-mcp-header" style="color: var(--text-muted); font-size: 0.75rem;">Bearer ••••••••</code>
+              <button class="btn btn-outline btn-sm" id="btn-copy-mcp-header" style="padding: 0.15rem 0.5rem; font-size: 0.72rem;" onclick="copyPublicMcpHeader()">Copy</button>
             </div>
           </div>
         </div>
@@ -2190,17 +2192,17 @@ function renderDashboard(origin: string, cf: any, env: Env, mcpToken: string = D
         <div style="background: rgba(0,0,0,0.35); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 8px; padding: 1rem;">
           <div style="font-weight: 600; color: #38bdf8; margin-bottom: 0.5rem; font-size: 0.88rem;">Option 1: Direct URL in Muse AI (Easiest)</div>
           <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.5rem;">Paste this complete URL into Muse AI's Remote MCP URL field:</p>
-          <pre style="margin: 0; padding: 0.6rem; font-size: 0.82rem; background: #06090e; overflow-x: auto;"><code>${mcpEndpoint}?token=${mcpToken}</code></pre>
+          <pre style="margin: 0; padding: 0.6rem; font-size: 0.82rem; background: #06090e; overflow-x: auto;"><code id="sample-url">${mcpEndpoint}?token=&lt;YOUR_SECRET_TOKEN&gt;</code></pre>
         </div>
         <div style="background: rgba(0,0,0,0.35); border: 1px solid rgba(34, 197, 94, 0.25); border-radius: 8px; padding: 1rem;">
           <div style="font-weight: 600; color: #22c55e; margin-bottom: 0.5rem; font-size: 0.88rem;">Option 2: Config JSON (Cursor / Claude)</div>
           <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.5rem;">Add to your mcpServers JSON configuration:</p>
-          <pre style="margin: 0; padding: 0.6rem; font-size: 0.76rem; background: #06090e; overflow-x: auto;"><code>{
+          <pre style="margin: 0; padding: 0.6rem; font-size: 0.76rem; background: #06090e; overflow-x: auto;"><code id="sample-json">{
   "mcpServers": {
     "cloudflare-mcp": {
-      "url": "${mcpEndpoint}?token=${mcpToken}",
+      "url": "${mcpEndpoint}?token=&lt;YOUR_SECRET_TOKEN&gt;",
       "headers": {
-        "Authorization": "Bearer ${mcpToken}"
+        "Authorization": "Bearer &lt;YOUR_SECRET_TOKEN&gt;"
       }
     }
   }
@@ -2292,6 +2294,133 @@ function renderDashboard(origin: string, cf: any, env: Env, mcpToken: string = D
 
   <script>
     let pollInterval = null;
+    let _adminMcpToken = "";
+
+    function applyMcpTokenToUI(token) {
+      if (!token) return;
+      _adminMcpToken = token;
+      const mcpInput = document.getElementById("admin-mcp-token-input");
+      if (mcpInput && document.activeElement !== mcpInput) {
+        mcpInput.value = token;
+      }
+      const pubUrl = document.getElementById("public-mcp-url");
+      if (pubUrl) pubUrl.textContent = "${origin}/mcp?token=" + token;
+      const pubSse = document.getElementById("public-sse-url");
+      if (pubSse) pubSse.textContent = "${origin}/sse?token=" + token;
+      const pubToken = document.getElementById("public-mcp-token");
+      if (pubToken) {
+        pubToken.textContent = token;
+        pubToken.style.color = "#38bdf8";
+      }
+      const pubHeader = document.getElementById("public-mcp-header");
+      if (pubHeader) {
+        pubHeader.textContent = "Bearer " + token;
+        pubHeader.style.color = "#22c55e";
+      }
+      const sampleUrl = document.getElementById("sample-url");
+      if (sampleUrl) sampleUrl.textContent = "${origin}/mcp?token=" + token;
+      const sampleJson = document.getElementById("sample-json");
+      if (sampleJson) {
+        sampleJson.textContent = JSON.stringify({
+          mcpServers: {
+            "cloudflare-mcp": {
+              url: "${origin}/mcp?token=" + token,
+              headers: {
+                Authorization: "Bearer " + token
+              }
+            }
+          }
+        }, null, 2);
+      }
+    }
+
+    function resetMcpTokenInUI() {
+      _adminMcpToken = "";
+      const mcpInput = document.getElementById("admin-mcp-token-input");
+      if (mcpInput) mcpInput.value = "";
+      const pubUrl = document.getElementById("public-mcp-url");
+      if (pubUrl) pubUrl.textContent = "${origin}/mcp?token=••••••••";
+      const pubSse = document.getElementById("public-sse-url");
+      if (pubSse) pubSse.textContent = "${origin}/sse?token=••••••••";
+      const pubToken = document.getElementById("public-mcp-token");
+      if (pubToken) {
+        pubToken.textContent = "🔒 Login to Reveal";
+        pubToken.style.color = "var(--yellow)";
+      }
+      const pubHeader = document.getElementById("public-mcp-header");
+      if (pubHeader) {
+        pubHeader.textContent = "Bearer ••••••••";
+        pubHeader.style.color = "var(--text-muted)";
+      }
+      const sampleUrl = document.getElementById("sample-url");
+      if (sampleUrl) sampleUrl.textContent = "${origin}/mcp?token=<YOUR_SECRET_TOKEN>";
+      const sampleJson = document.getElementById("sample-json");
+      if (sampleJson) {
+        sampleJson.textContent = JSON.stringify({
+          mcpServers: {
+            "cloudflare-mcp": {
+              url: "${origin}/mcp?token=<YOUR_SECRET_TOKEN>",
+              headers: {
+                Authorization: "Bearer <YOUR_SECRET_TOKEN>"
+              }
+            }
+          }
+        }, null, 2);
+      }
+    }
+
+    function copyPublicMcpUrl() {
+      if (_adminMcpToken) {
+        navigator.clipboard.writeText("${origin}/mcp?token=" + _adminMcpToken);
+        alert("✅ Copied Tokenized MCP URL to clipboard!");
+      } else {
+        navigator.clipboard.writeText("${origin}/mcp");
+        alert("ℹ️ Copied Base MCP URL (${origin}/mcp).\\n\\n🔒 Log in as Admin to copy URL with your Secret Token attached!");
+      }
+    }
+
+    function copyPublicSseUrl() {
+      if (_adminMcpToken) {
+        navigator.clipboard.writeText("${origin}/sse?token=" + _adminMcpToken);
+        alert("✅ Copied Tokenized SSE URL to clipboard!");
+      } else {
+        navigator.clipboard.writeText("${origin}/sse");
+        alert("ℹ️ Copied Base SSE URL (${origin}/sse).\\n\\n🔒 Log in as Admin to copy URL with your Secret Token attached!");
+      }
+    }
+
+    function copyPublicMcpToken() {
+      if (_adminMcpToken) {
+        navigator.clipboard.writeText(_adminMcpToken);
+        alert("✅ Copied MCP Secret Token to clipboard!");
+      } else {
+        openLoginModal();
+      }
+    }
+
+    function copyPublicMcpHeader() {
+      if (_adminMcpToken) {
+        navigator.clipboard.writeText("Bearer " + _adminMcpToken);
+        alert("✅ Copied Authorization Header to clipboard!");
+      } else {
+        openLoginModal();
+      }
+    }
+
+    function copyAdminMcpToken() {
+      const val = document.getElementById("admin-mcp-token-input").value;
+      if (val) {
+        navigator.clipboard.writeText(val);
+        alert("✅ Copied MCP Secret Token to clipboard!");
+      }
+    }
+
+    function toggleTokenVisibility(inputId) {
+      const input = document.getElementById(inputId);
+      if (input) {
+        input.type = input.type === "password" ? "text" : "password";
+      }
+    }
 
     // Check login status on page load
     window.addEventListener("DOMContentLoaded", async () => {
@@ -2304,11 +2433,16 @@ function renderDashboard(origin: string, cf: any, env: Env, mcpToken: string = D
         const data = await res.json();
         if (data.authenticated) {
           showAdminPanel(data.user || "smsohag");
+          if (data.mcpToken) {
+            applyMcpTokenToUI(data.mcpToken);
+          }
         } else {
           hideAdminPanel();
+          resetMcpTokenInUI();
         }
       } catch (err) {
         hideAdminPanel();
+        resetMcpTokenInUI();
       }
     }
 
@@ -2429,6 +2563,7 @@ function renderDashboard(origin: string, cf: any, env: Env, mcpToken: string = D
         await fetch("/api/logout", { method: "POST" });
       } catch {}
       hideAdminPanel();
+      resetMcpTokenInUI();
     }
 
     async function refreshAdminLogs() {
@@ -2466,10 +2601,7 @@ function renderDashboard(origin: string, cf: any, env: Env, mcpToken: string = D
         renderCredentialsTable(data.credentials || [], data.oauthApps);
 
         if (data.mcpToken) {
-          const mcpInput = document.getElementById("admin-mcp-token-input");
-          if (mcpInput && document.activeElement !== mcpInput) {
-            mcpInput.value = data.mcpToken;
-          }
+          applyMcpTokenToUI(data.mcpToken);
         }
       } catch (err) {
         console.error("Error refreshing logs:", err);

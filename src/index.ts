@@ -2278,10 +2278,10 @@ Key Automation Tools:
         });
         const data = await res.json();
         if (data.success) {
-          alert("✅ [" + platform.toUpperCase() + " Connection Healthy]\n\n" + data.message);
+          alert("✅ [" + platform.toUpperCase() + " Connection Healthy]\\n\\n" + data.message);
           await refreshAdminLogs();
         } else {
-          alert("❌ [" + platform.toUpperCase() + " Connection Error]\n\n" + (data.error || "Verification failed. Token may be expired or invalid."));
+          alert("❌ [" + platform.toUpperCase() + " Connection Error]\\n\\n" + (data.error || "Verification failed. Token may be expired or invalid."));
         }
       } catch (err) {
         alert("❌ Network error testing " + platform + ": " + err.message);
@@ -2309,7 +2309,7 @@ Key Automation Tools:
           return;
         }
 
-        let summary = "🧪 Live Connection Test Results (" + creds.length + " Providers):\n\n";
+        let summary = "🧪 Live Connection Test Results (" + creds.length + " Providers):\\n\\n";
         for (const c of creds) {
           try {
             const testRes = await fetch("/api/admin/test-connection", {
@@ -2319,12 +2319,12 @@ Key Automation Tools:
             });
             const result = await testRes.json();
             if (result.success) {
-              summary += "• " + c.platform.toUpperCase() + ": " + result.message + "\n\n";
+              summary += "• " + c.platform.toUpperCase() + ": " + result.message + "\\n\\n";
             } else {
-              summary += "• " + c.platform.toUpperCase() + ": ❌ " + result.error + "\n\n";
+              summary += "• " + c.platform.toUpperCase() + ": ❌ " + result.error + "\\n\\n";
             }
           } catch (err) {
-            summary += "• " + c.platform.toUpperCase() + ": ❌ " + err.message + "\n\n";
+            summary += "• " + c.platform.toUpperCase() + ": ❌ " + err.message + "\\n\\n";
           }
         }
         alert(summary);

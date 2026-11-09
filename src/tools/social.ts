@@ -243,7 +243,28 @@ export async function executeSocialTool(
       }
 
       if (!authorUrn) {
-        authorUrn = "urn:li:person:me";
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  success: false,
+                  error: "LinkedIn Author URN missing",
+                  reason:
+                    "Your LinkedIn Access Token was generated with only 'w_member_social' permission. LinkedIn requires 'openid' & 'profile' scopes to auto-detect your member URN via /v2/userinfo.",
+                  solutions: [
+                    "Solution 1 (Recommended, 1 minute): In LinkedIn Developer Portal -> Products tab -> request access to 'Sign In with LinkedIn using OpenID Connect' (instant approval). Then in Token Generator, generate a token with 'openid', 'profile', and 'w_member_social' scopes and save to D1.",
+                    "Solution 2: Provide your Person URN manually (e.g. 'urn:li:person:YOUR_ID' or 'urn:li:member:YOUR_ID') in the author_urn argument or extra_data in D1.",
+                  ],
+                },
+                null,
+                2
+              ),
+            },
+          ],
+          isError: true,
+        };
       }
 
       // Step 2: Build UGC post body

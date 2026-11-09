@@ -21,6 +21,7 @@ export interface MCPToolProperty {
   description: string;
   enum?: string[];
   default?: any;
+  items?: any;
 }
 
 export interface MCPToolDefinition {

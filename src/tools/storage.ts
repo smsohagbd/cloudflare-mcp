@@ -10,8 +10,8 @@ export const STORAGE_TOOLS: MCPToolDefinition[] = [
       properties: {
         platform: {
           type: "string",
-          description: "Target platform (linkedin, youtube, facebook, system)",
-          enum: ["linkedin", "youtube", "facebook", "system"],
+          description: "Target platform (github, linkedin, youtube, facebook, system)",
+          enum: ["github", "linkedin", "youtube", "facebook", "system"],
         },
         content: {
           type: "string",
@@ -175,23 +175,22 @@ export const STORAGE_TOOLS: MCPToolDefinition[] = [
   },
   {
     name: "manage_social_credentials",
-    description: "Store, retrieve, or list API tokens and credentials for social media platforms (LinkedIn, YouTube, Facebook) in D1.",
+    description: "Store, retrieve, delete, or list API tokens and credentials for social media and developer platforms (GitHub, LinkedIn, YouTube, Facebook, custom) in D1.",
     inputSchema: {
       type: "object",
       properties: {
         action: {
           type: "string",
-          description: "Action: 'get', 'set', or 'list'",
-          enum: ["get", "set", "list"],
+          description: "Action: 'get', 'set', 'delete', or 'list'",
+          enum: ["get", "set", "delete", "list"],
         },
         platform: {
           type: "string",
-          description: "Platform: 'linkedin', 'youtube', or 'facebook'",
-          enum: ["linkedin", "youtube", "facebook"],
+          description: "Platform: 'github', 'linkedin', 'youtube', 'facebook', or any custom platform name",
         },
         access_token: {
           type: "string",
-          description: "OAuth access token (required for 'set')",
+          description: "OAuth or Personal Access Token (required for 'set')",
         },
         refresh_token: {
           type: "string",
@@ -199,7 +198,7 @@ export const STORAGE_TOOLS: MCPToolDefinition[] = [
         },
         extra_data: {
           type: "string",
-          description: "Optional JSON metadata like channel_id, page_id, or organization_urn (for 'set')",
+          description: "Optional JSON metadata like username, channel_id, page_id, or organization_urn (for 'set')",
         },
       },
       required: ["action"],
@@ -463,6 +462,24 @@ export async function executeStorageTool(
             {
               type: "text",
               text: JSON.stringify({ platform, configured: true, details: row }, null, 2),
+            },
+          ],
+        };
+      }
+
+      if (action === "delete") {
+        if (!platform) {
+          return { content: [{ type: "text", text: "Error: platform is required for 'delete'" }], isError: true };
+        }
+        await db.prepare("DELETE FROM social_credentials WHERE platform = ?").bind(platform).run();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                success: true,
+                message: `Credentials for '${platform}' deleted successfully from D1 database`,
+              }, null, 2),
             },
           ],
         };

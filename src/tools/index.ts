@@ -2,6 +2,7 @@ import { MCPToolDefinition, MCPToolResult } from "../mcp/types";
 import { GENERAL_TOOLS, executeGeneralTool, ToolContext } from "./general";
 import { STORAGE_TOOLS, executeStorageTool } from "./storage";
 import { SOCIAL_TOOLS, executeSocialTool } from "./social";
+import { GITHUB_TOOLS, executeGithubTool } from "./github";
 
 export type { ToolContext };
 
@@ -9,6 +10,7 @@ export const TOOLS: MCPToolDefinition[] = [
   ...GENERAL_TOOLS,
   ...STORAGE_TOOLS,
   ...SOCIAL_TOOLS,
+  ...GITHUB_TOOLS,
 ];
 
 export async function executeTool(
@@ -28,6 +30,10 @@ export async function executeTool(
     // 3. Try Social Automation Tools (LinkedIn, YouTube)
     const socialRes = await executeSocialTool(name, args, ctx);
     if (socialRes) return socialRes;
+
+    // 4. Try GitHub Tools
+    const githubRes = await executeGithubTool(name, args, ctx);
+    if (githubRes) return githubRes;
 
     return {
       content: [{ type: "text", text: `Tool '${name}' not found` }],

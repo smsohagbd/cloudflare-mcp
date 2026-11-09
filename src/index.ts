@@ -14,6 +14,9 @@ export interface Env {
   LINKEDIN_ACCESS_TOKEN?: string;
   YOUTUBE_ACCESS_TOKEN?: string;
   YOUTUBE_API_KEY?: string;
+  GITHUB_ACCESS_TOKEN?: string;
+  GITHUB_CLIENT_ID?: string;
+  GITHUB_CLIENT_SECRET?: string;
 }
 
 const DEFAULT_SECRET = "smsohag-cloudflare-mcp-secret-2026-auth";
@@ -71,6 +74,42 @@ function extractToken(request: Request): string | null {
   return null;
 }
 
+export async function getOAuthAppConfig(
+  platform: "linkedin" | "github",
+  db: D1Database | null | undefined,
+  env: Env
+): Promise<{ clientId: string; clientSecret: string }> {
+  let clientId = "";
+  let clientSecret = "";
+
+  if (db) {
+    try {
+      const row: any = await db
+        .prepare("SELECT access_token, extra_data FROM social_credentials WHERE platform = ?")
+        .bind(`${platform}_oauth_app`)
+        .first();
+      if (row && row.access_token) {
+        clientSecret = row.access_token;
+        const extra = JSON.parse(row.extra_data || "{}");
+        clientId = extra.client_id || "";
+      }
+    } catch {}
+  }
+
+  if (!clientId) {
+    clientId = platform === "linkedin"
+      ? (env.LINKEDIN_CLIENT_ID || "862xwbz3mk9f4n")
+      : (env.GITHUB_CLIENT_ID || "");
+  }
+  if (!clientSecret) {
+    clientSecret = platform === "linkedin"
+      ? (env.LINKEDIN_CLIENT_SECRET || "")
+      : (env.GITHUB_CLIENT_SECRET || "");
+  }
+
+  return { clientId, clientSecret };
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -108,9 +147,10 @@ export default {
 
     // LinkedIn OAuth Step 1: Redirect user to LinkedIn authorization page
     if (url.pathname === "/auth/linkedin") {
-      const clientId = env.LINKEDIN_CLIENT_ID || "862xwbz3mk9f4n";
+      const { clientId } = await getOAuthAppConfig("linkedin", env.DB, env);
       const redirectUri = `${url.origin}/auth/linkedin/callback`;
-      const scopes = encodeURIComponent("openid profile w_member_social email");
+      const customScope = url.searchParams.get("scope");
+      const scopes = customScope ? encodeURIComponent(customScope) : encodeURIComponent("openid profile w_member_social email");
       const linkedinAuthUrl = `https://www.linkedin.com/oauth/v2/authorization?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${scopes}&state=mcp_linkedin`;
 
       return Response.redirect(linkedinAuthUrl, 302);
@@ -120,9 +160,26 @@ export default {
     if (url.pathname === "/auth/linkedin/callback") {
       const error = url.searchParams.get("error");
       const errorDesc = url.searchParams.get("error_description");
+      const { clientId, clientSecret } = await getOAuthAppConfig("linkedin", env.DB, env);
+
       if (error) {
+        let helpTip = `LinkedIn error: <code>${error}</code> &mdash; ${errorDesc || ""}`;
+        if (error === "unauthorized_scope_error") {
+          helpTip = `
+            <div style="text-align: left; background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); padding: 1rem; border-radius: 8px; margin-top: 1rem; font-size: 0.88rem; line-height: 1.6;">
+              <strong style="color: #ef4444;">Why this happened:</strong><br>
+              Your LinkedIn Developer App (<code>${clientId}</code>) has not added the <strong>"Sign In with LinkedIn using OpenID Connect"</strong> product.<br><br>
+              <strong style="color: #38bdf8;">How to fix in 1 minute:</strong><br>
+              1. Go to <a href="https://www.linkedin.com/developers/apps" target="_blank" style="color: #38bdf8; text-decoration: underline;">LinkedIn Developer Portal</a> &rarr; click your App.<br>
+              2. Go to the <strong>Products</strong> tab.<br>
+              3. Find <strong>"Sign In with LinkedIn using OpenID Connect"</strong> &rarr; click <strong>Request access</strong> (instant approval).<br>
+              4. Make sure <strong>"Share on LinkedIn"</strong> is also requested.<br>
+              5. Click Connect again from the Dashboard!
+            </div>
+          `;
+        }
         return new Response(
-          renderOAuthResult("LinkedIn Connection Failed", `LinkedIn error: ${error} - ${errorDesc || ""}`, false, url.origin),
+          renderOAuthResult("LinkedIn Connection Failed", helpTip, false, url.origin),
           { status: 400, headers: { "Content-Type": "text/html; charset=utf-8" } }
         );
       }
@@ -135,8 +192,18 @@ export default {
         );
       }
 
-      const clientId = env.LINKEDIN_CLIENT_ID || "862xwbz3mk9f4n";
-      const clientSecret = env.LINKEDIN_CLIENT_SECRET || "";
+      if (!clientSecret) {
+        return new Response(
+          renderOAuthResult(
+            "Client Secret Missing",
+            `LinkedIn Client Secret is not set. Please paste your Primary Client Secret in the dashboard under <strong>OAuth Developer App Config</strong> and click Save to D1.`,
+            false,
+            url.origin
+          ),
+          { status: 400, headers: { "Content-Type": "text/html; charset=utf-8" } }
+        );
+      }
+
       const redirectUri = `${url.origin}/auth/linkedin/callback`;
 
       try {
@@ -154,8 +221,24 @@ export default {
 
         if (!tokenRes.ok) {
           const errBody = await tokenRes.text();
+          let helpfulMsg = `LinkedIn rejected token exchange: ${errBody}`;
+          if (errBody.includes("invalid_client")) {
+            helpfulMsg = `<div style="text-align: left; background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); padding: 1.25rem; border-radius: 8px; margin-bottom: 1.5rem; font-size: 0.9rem;">
+              <strong style="color: #ef4444; font-size: 1.05rem; display: block; margin-bottom: 0.6rem;">⚠️ Primary Client Secret Mismatch!</strong>
+              LinkedIn rejected the token exchange because the Primary Client Secret currently stored in Cloudflare D1 does not match Client ID <code>${clientId}</code>.<br><br>
+              <strong>How to fix in 1 minute:</strong>
+              <ol style="margin-top: 0.5rem; padding-left: 1.2rem; line-height: 1.7;">
+                <li>Open your <a href="https://www.linkedin.com/developers/apps/264234107/auth" target="_blank" style="color: #38bdf8; text-decoration: underline; font-weight: bold;">LinkedIn Developer App &rarr; Auth tab ↗</a></li>
+                <li>Click the copy icon 📋 next to <strong>Primary Client Secret</strong> (starts with <code>WPL_AP1...</code>)</li>
+                <li>Return to <a href="${url.origin}" style="color: #38bdf8; text-decoration: underline; font-weight: bold;">mcp.sohag.com.bd Dashboard</a> &rarr; go to <strong>🔑 Social Credentials</strong> tab</li>
+                <li>Under <em>1-Click OAuth App Configuration</em>, paste the secret into <strong>Primary Client Secret</strong></li>
+                <li>Click <strong>🧪 Test Secret</strong> to verify it, then click <strong>💾 Save Secret to D1</strong></li>
+                <li>Finally, click <strong>🚀 Connect LinkedIn</strong>!</li>
+              </ol>
+            </div>`;
+          }
           return new Response(
-            renderOAuthResult("Token Exchange Failed", `LinkedIn rejected token exchange: ${errBody}`, false, url.origin),
+            renderOAuthResult("Token Exchange Failed", helpfulMsg, false, url.origin),
             { status: 400, headers: { "Content-Type": "text/html; charset=utf-8" } }
           );
         }
@@ -206,6 +289,137 @@ export default {
           renderOAuthResult(
             "LinkedIn Successfully Connected!",
             `Connected as <strong>${memberName}</strong> (${authorUrn})! Token saved to Cloudflare D1. Muse AI can now publish posts automatically!`,
+            true,
+            url.origin
+          ),
+          { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } }
+        );
+      } catch (err: any) {
+        return new Response(
+          renderOAuthResult("Connection Error", err.message, false, url.origin),
+          { status: 500, headers: { "Content-Type": "text/html; charset=utf-8" } }
+        );
+      }
+    }
+
+    // GitHub OAuth Step 1: Redirect user to GitHub authorization page
+    if (url.pathname === "/auth/github") {
+      const { clientId } = await getOAuthAppConfig("github", env.DB, env);
+      if (!clientId) {
+        return new Response(
+          renderOAuthResult(
+            "GitHub Client ID Missing",
+            "<code>GITHUB_CLIENT_ID</code> is not configured. You can either configure your GitHub OAuth App in the dashboard or paste a Personal Access Token directly.",
+            false,
+            url.origin
+          ),
+          { status: 400, headers: { "Content-Type": "text/html; charset=utf-8" } }
+        );
+      }
+      const redirectUri = `${url.origin}/auth/github/callback`;
+      const scopes = encodeURIComponent("repo,read:user,gist");
+      const githubAuthUrl = `https://github.com/login/oauth/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${scopes}&state=mcp_github`;
+
+      return Response.redirect(githubAuthUrl, 302);
+    }
+
+    // GitHub OAuth Step 2: Callback handler
+    if (url.pathname === "/auth/github/callback") {
+      const error = url.searchParams.get("error");
+      const errorDesc = url.searchParams.get("error_description");
+      if (error) {
+        return new Response(
+          renderOAuthResult("GitHub Connection Failed", `GitHub error: ${error} - ${errorDesc || ""}`, false, url.origin),
+          { status: 400, headers: { "Content-Type": "text/html; charset=utf-8" } }
+        );
+      }
+
+      const code = url.searchParams.get("code");
+      if (!code) {
+        return new Response(
+          renderOAuthResult("Missing Authorization Code", "No authorization code received from GitHub.", false, url.origin),
+          { status: 400, headers: { "Content-Type": "text/html; charset=utf-8" } }
+        );
+      }
+
+      const { clientId, clientSecret } = await getOAuthAppConfig("github", env.DB, env);
+      const redirectUri = `${url.origin}/auth/github/callback`;
+
+      try {
+        const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+          },
+          body: JSON.stringify({
+            client_id: clientId,
+            client_secret: clientSecret,
+            code,
+            redirect_uri: redirectUri,
+          }),
+        });
+
+        if (!tokenRes.ok) {
+          const errBody = await tokenRes.text();
+          return new Response(
+            renderOAuthResult("Token Exchange Failed", `GitHub rejected token exchange: ${errBody}`, false, url.origin),
+            { status: 400, headers: { "Content-Type": "text/html; charset=utf-8" } }
+          );
+        }
+
+        const tokenData = (await tokenRes.json()) as any;
+        if (tokenData.error) {
+          return new Response(
+            renderOAuthResult("GitHub OAuth Error", `${tokenData.error_description || tokenData.error}`, false, url.origin),
+            { status: 400, headers: { "Content-Type": "text/html; charset=utf-8" } }
+          );
+        }
+
+        const accessToken = tokenData.access_token;
+        const tokenType = tokenData.token_type || "Bearer";
+
+        // Query user info from GitHub
+        let username = "GitHub User";
+        let userUrl = "https://github.com";
+        try {
+          const profileRes = await fetch("https://api.github.com/user", {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "User-Agent": "Cloudflare-MCP-Hub/1.0",
+              Accept: "application/vnd.github.v3+json",
+            },
+          });
+          if (profileRes.ok) {
+            const profile = (await profileRes.json()) as any;
+            username = profile.login || username;
+            userUrl = profile.html_url || userUrl;
+          }
+        } catch {}
+
+        if (env.DB) {
+          const extraData = JSON.stringify({
+            login: username,
+            html_url: userUrl,
+            connectedVia: "1-Click OAuth",
+          });
+          const now = new Date().toISOString();
+
+          await env.DB.prepare(`
+            INSERT INTO social_credentials (platform, access_token, token_type, extra_data, updated_at)
+            VALUES ('github', ?, ?, ?, ?)
+            ON CONFLICT(platform) DO UPDATE SET
+              access_token = excluded.access_token,
+              token_type = excluded.token_type,
+              extra_data = excluded.extra_data,
+              updated_at = excluded.updated_at
+          `).bind(accessToken, tokenType, extraData, now).run();
+        }
+
+        return new Response(
+          renderOAuthResult(
+            "GitHub Successfully Connected!",
+            `Connected as <strong><a href="${userUrl}" target="_blank" style="color: #38bdf8;">@${username}</a></strong>! Token saved to Cloudflare D1. AI agents can now create issues, gists, and manage repos automatically!`,
             true,
             url.origin
           ),
@@ -293,13 +507,35 @@ export default {
       const platform = String(body.platform || "").toLowerCase();
       const accessToken = String(body.access_token || "").trim();
       const refreshToken = body.refresh_token ? String(body.refresh_token).trim() : null;
-      const extraData = body.extra_data ? String(body.extra_data).trim() : null;
+      let extraData = body.extra_data ? String(body.extra_data).trim() : null;
 
       if (!platform || !accessToken) {
         return new Response(JSON.stringify({ error: "Platform and Access Token are required" }), {
           status: 400,
           headers: { "Content-Type": "application/json", ...corsHeaders },
         });
+      }
+
+      // Auto-detect GitHub profile if extra_data is empty
+      if (platform === "github" && (!extraData || extraData === "{}")) {
+        try {
+          const ghRes = await fetch("https://api.github.com/user", {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "User-Agent": "Cloudflare-MCP-Hub/1.0",
+              Accept: "application/vnd.github.v3+json",
+            },
+          });
+          if (ghRes.ok) {
+            const ghUser = (await ghRes.json()) as any;
+            extraData = JSON.stringify({
+              login: ghUser.login,
+              name: ghUser.name || ghUser.login,
+              html_url: ghUser.html_url,
+              avatar_url: ghUser.avatar_url,
+            });
+          }
+        } catch {}
       }
 
       const now = new Date().toISOString();
@@ -317,6 +553,446 @@ export default {
         status: 200,
         headers: { "Content-Type": "application/json", ...corsHeaders },
       });
+    }
+
+    // Admin Credentials delete: DELETE /api/admin/credentials or POST /api/admin/credentials/delete
+    if (
+      (url.pathname === "/api/admin/credentials" && request.method === "DELETE") ||
+      (url.pathname === "/api/admin/credentials/delete" && request.method === "POST")
+    ) {
+      const token = extractToken(request);
+      const secret = env.JWT_SECRET || DEFAULT_SECRET;
+      const isValid = token ? await verifyToken(token, secret) : false;
+
+      if (!isValid) {
+        return new Response(JSON.stringify({ error: "Unauthorized. Please log in." }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      if (!env.DB) {
+        return new Response(JSON.stringify({ error: "Database not connected" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      let platform = url.searchParams.get("platform") || "";
+      if (!platform && request.method === "POST") {
+        try {
+          const body: any = await request.json();
+          platform = body.platform || "";
+        } catch {}
+      }
+      platform = platform.toLowerCase().trim();
+
+      if (!platform) {
+        return new Response(JSON.stringify({ error: "Platform name is required to delete" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      await env.DB.prepare("DELETE FROM social_credentials WHERE platform = ?").bind(platform).run();
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          message: `Successfully deleted ${platform} credentials from Cloudflare D1!`,
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        }
+      );
+    }
+
+    // Admin OAuth App Credentials update: POST /api/admin/oauth-app
+    if (url.pathname === "/api/admin/oauth-app" && request.method === "POST") {
+      const token = extractToken(request);
+      const secret = env.JWT_SECRET || DEFAULT_SECRET;
+      const isValid = token ? await verifyToken(token, secret) : false;
+
+      if (!isValid) {
+        return new Response(JSON.stringify({ error: "Unauthorized. Please log in." }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      if (!env.DB) {
+        return new Response(JSON.stringify({ error: "Database not connected" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      let body: any = {};
+      try { body = await request.json(); } catch {}
+      const platform = String(body.platform || "").toLowerCase().trim();
+      const clientId = String(body.client_id || "").trim();
+      const clientSecret = String(body.client_secret || "").trim();
+
+      if (!platform || !clientId || !clientSecret) {
+        return new Response(JSON.stringify({ error: "Platform, Client ID, and Client Secret are required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      const now = new Date().toISOString();
+      const extraData = JSON.stringify({ client_id: clientId });
+      const recordPlatform = `${platform}_oauth_app`;
+
+      await env.DB.prepare(`
+        INSERT INTO social_credentials (platform, access_token, token_type, extra_data, updated_at)
+        VALUES (?, ?, 'OAuthApp', ?, ?)
+        ON CONFLICT(platform) DO UPDATE SET
+          access_token = excluded.access_token,
+          extra_data = excluded.extra_data,
+          updated_at = excluded.updated_at
+      `).bind(recordPlatform, clientSecret, extraData, now).run();
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          message: `Successfully saved ${platform} Client Secret to Cloudflare D1! 1-Click OAuth is now ready.`,
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        }
+      );
+    }
+
+    // Test OAuth App Credentials: POST /api/admin/test-oauth-app
+    if (url.pathname === "/api/admin/test-oauth-app" && request.method === "POST") {
+      const token = extractToken(request);
+      const secret = env.JWT_SECRET || DEFAULT_SECRET;
+      const isValid = token ? await verifyToken(token, secret) : false;
+
+      if (!isValid) {
+        return new Response(JSON.stringify({ error: "Unauthorized. Please log in." }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      let body: any = {};
+      try { body = await request.json(); } catch {}
+      const platform = String(body.platform || "linkedin").toLowerCase().trim();
+      let clientId = String(body.client_id || "").trim();
+      let clientSecret = String(body.client_secret || "").trim();
+
+      // If secret not provided in body, read from D1
+      if (!clientSecret && env.DB) {
+        const appCfg = await getOAuthAppConfig(platform as any, env.DB, env);
+        clientId = clientId || appCfg.clientId;
+        clientSecret = appCfg.clientSecret;
+      }
+
+      if (!clientSecret) {
+        return new Response(JSON.stringify({ success: false, error: "Please enter or save a Client Secret first." }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      if (platform === "linkedin") {
+        try {
+          const testRes = await fetch("https://www.linkedin.com/oauth/v2/accessToken", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({
+              grant_type: "client_credentials",
+              client_id: clientId,
+              client_secret: clientSecret,
+            }).toString(),
+          });
+          const text = await testRes.text();
+          let json: any = {};
+          try { json = JSON.parse(text); } catch {}
+
+          if (json.error === "invalid_client") {
+            return new Response(
+              JSON.stringify({
+                success: false,
+                error: `LinkedIn rejected this secret: "invalid_client - Client authentication failed". The secret does not match Client ID ${clientId}. Please copy the Primary Client Secret from your LinkedIn Developer App.`,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+            );
+          }
+
+          // If unauthorized_client or 200 OK, the client authentication SUCCEEDED
+          return new Response(
+            JSON.stringify({
+              success: true,
+              message: `✅ LinkedIn Client ID and Secret are verified and valid!`,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        } catch (err: any) {
+          return new Response(
+            JSON.stringify({ success: false, error: "Network error testing with LinkedIn: " + err.message }),
+            { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        }
+      }
+
+      if (platform === "github") {
+        try {
+          const credHeader = btoa(`${clientId}:${clientSecret}`);
+          const testRes = await fetch(`https://api.github.com/applications/${clientId}/token`, {
+            method: "POST",
+            headers: {
+              Authorization: `Basic ${credHeader}`,
+              "User-Agent": "Cloudflare-MCP-Hub/1.0",
+              Accept: "application/vnd.github.v3+json",
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ access_token: "dummy_token_to_verify_credentials" }),
+          });
+          const text = await testRes.text();
+          let json: any = {};
+          try { json = JSON.parse(text); } catch {}
+
+          if (testRes.status === 401 || json.message === "Bad credentials") {
+            return new Response(
+              JSON.stringify({
+                success: false,
+                error: `GitHub rejected this secret: "Bad credentials". Client ID or Secret does not match.`,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+            );
+          }
+
+          return new Response(
+            JSON.stringify({
+              success: true,
+              message: `✅ GitHub Client ID and Secret are verified and valid!`,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        } catch (err: any) {
+          return new Response(
+            JSON.stringify({ success: false, error: "Network error testing with GitHub: " + err.message }),
+            { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        }
+      }
+
+      return new Response(
+        JSON.stringify({ success: true, message: `OAuth App credentials for ${platform} recorded.` }),
+        { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
+    }
+
+    // Test Connection for an active platform token: POST /api/admin/test-connection
+    if (url.pathname === "/api/admin/test-connection" && request.method === "POST") {
+      const token = extractToken(request);
+      const secret = env.JWT_SECRET || DEFAULT_SECRET;
+      const isValid = token ? await verifyToken(token, secret) : false;
+
+      if (!isValid) {
+        return new Response(JSON.stringify({ error: "Unauthorized. Please log in." }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      let body: any = {};
+      try { body = await request.json(); } catch {}
+      const platform = String(body.platform || "").toLowerCase().trim();
+      let accessToken = String(body.access_token || "").trim();
+
+      // If not passed in body, read from D1 social_credentials
+      if (!accessToken && env.DB) {
+        try {
+          const row: any = await env.DB.prepare("SELECT access_token FROM social_credentials WHERE platform = ?").bind(platform).first();
+          if (row && row.access_token) {
+            accessToken = row.access_token;
+          }
+        } catch {}
+      }
+
+      if (!accessToken) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: `No access token found for ${platform}. Please connect or paste an access token first.`,
+          }),
+          { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+        );
+      }
+
+      if (platform === "linkedin") {
+        try {
+          const res = await fetch("https://api.linkedin.com/v2/userinfo", {
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+          if (res.ok) {
+            const data: any = await res.json();
+            return new Response(
+              JSON.stringify({
+                success: true,
+                message: `✅ LinkedIn is Working! Connected as: ${data.name || "Member"} (URN: ${data.sub ? ("urn:li:person:" + data.sub) : "OK"})`,
+                data,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+            );
+          }
+          const errText = await res.text();
+          return new Response(
+            JSON.stringify({
+              success: false,
+              error: `LinkedIn Token Failed (HTTP ${res.status}): ${errText}`,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        } catch (err: any) {
+          return new Response(
+            JSON.stringify({ success: false, error: "Network error: " + err.message }),
+            { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        }
+      }
+
+      if (platform === "github") {
+        try {
+          const res = await fetch("https://api.github.com/user", {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "User-Agent": "Cloudflare-MCP-Hub/1.0",
+              Accept: "application/vnd.github.v3+json",
+            },
+          });
+          if (res.ok) {
+            const data: any = await res.json();
+            return new Response(
+              JSON.stringify({
+                success: true,
+                message: `✅ GitHub is Working! Connected as: @${data.login} (${data.name || "User"}) &bull; Repos: ${data.public_repos}`,
+                data,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+            );
+          }
+          const errText = await res.text();
+          return new Response(
+            JSON.stringify({
+              success: false,
+              error: `GitHub Token Failed (HTTP ${res.status}): ${errText}`,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        } catch (err: any) {
+          return new Response(
+            JSON.stringify({ success: false, error: "Network error: " + err.message }),
+            { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        }
+      }
+
+      if (platform === "youtube") {
+        try {
+          const res = await fetch("https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true", {
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+          if (res.ok) {
+            const data: any = await res.json();
+            const title = data?.items?.[0]?.snippet?.title || "Channel";
+            return new Response(
+              JSON.stringify({
+                success: true,
+                message: `✅ YouTube is Working! Connected Channel: ${title}`,
+                data,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+            );
+          }
+          const errText = await res.text();
+          return new Response(
+            JSON.stringify({
+              success: false,
+              error: `YouTube Token Failed (HTTP ${res.status}): ${errText}`,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        } catch (err: any) {
+          return new Response(
+            JSON.stringify({ success: false, error: "Network error: " + err.message }),
+            { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        }
+      }
+
+      if (platform === "facebook") {
+        try {
+          const res = await fetch(`https://graph.facebook.com/me?access_token=${encodeURIComponent(accessToken)}`);
+          if (res.ok) {
+            const data: any = await res.json();
+            return new Response(
+              JSON.stringify({
+                success: true,
+                message: `✅ Facebook is Working! Account: ${data.name || data.id}`,
+                data,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+            );
+          }
+          const errText = await res.text();
+          return new Response(
+            JSON.stringify({
+              success: false,
+              error: `Facebook Token Failed (HTTP ${res.status}): ${errText}`,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        } catch (err: any) {
+          return new Response(
+            JSON.stringify({ success: false, error: "Network error: " + err.message }),
+            { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        }
+      }
+
+      if (platform === "x" || platform === "twitter") {
+        try {
+          const res = await fetch("https://api.twitter.com/2/users/me", {
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+          if (res.ok) {
+            const data: any = await res.json();
+            return new Response(
+              JSON.stringify({
+                success: true,
+                message: `✅ X (Twitter) is Working! Account: @${data.data?.username || "user"} (${data.data?.name || ""})`,
+                data,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+            );
+          }
+          const errText = await res.text();
+          return new Response(
+            JSON.stringify({
+              success: false,
+              error: `X Token Failed (HTTP ${res.status}): ${errText}`,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        } catch (err: any) {
+          return new Response(
+            JSON.stringify({ success: false, error: "Network error: " + err.message }),
+            { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        }
+      }
+
+      return new Response(
+        JSON.stringify({ success: true, message: `Token for ${platform} verified.` }),
+        { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
     }
 
     // Live Admin Logs endpoint: GET /api/admin/logs
@@ -346,8 +1022,9 @@ export default {
           const commentRows = await env.DB.prepare("SELECT * FROM comments_log ORDER BY id DESC LIMIT 50").all();
           comments = commentRows.results || [];
 
-          const credRows = await env.DB.prepare("SELECT platform, token_type, expires_at, updated_at FROM social_credentials").all();
-          credentials = credRows.results || [];
+          const credRows = await env.DB.prepare("SELECT platform, token_type, expires_at, extra_data, updated_at FROM social_credentials").all();
+          const allCreds = credRows.results || [];
+          credentials = allCreds.filter((c: any) => !c.platform.endsWith("_oauth_app"));
 
           // Compute stats
           stats.totalPosts = posts.length;
@@ -371,6 +1048,13 @@ export default {
         } catch {}
       }
 
+      const liApp = await getOAuthAppConfig("linkedin", env.DB, env);
+      const ghApp = await getOAuthAppConfig("github", env.DB, env);
+      const oauthApps = {
+        linkedin: { clientId: liApp.clientId, hasSecret: !!liApp.clientSecret },
+        github: { clientId: ghApp.clientId, hasSecret: !!ghApp.clientSecret },
+      };
+
       return new Response(
         JSON.stringify({
           success: true,
@@ -379,6 +1063,7 @@ export default {
           comments,
           media,
           credentials,
+          oauthApps,
           timestamp: new Date().toISOString(),
         }),
         {
@@ -829,43 +1514,116 @@ function renderDashboard(origin: string, cf: any, env: Env): string {
 
         <!-- Tab 4: Social Credentials -->
         <div id="credentials-tab" class="tab-content" style="display: none;">
-          <!-- 1-Click LinkedIn OAuth Banner -->
-          <div style="background: rgba(10, 102, 194, 0.12); border: 1px solid rgba(10, 102, 194, 0.35); border-radius: 10px; padding: 1.25rem; margin-bottom: 1.25rem;">
-            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem;">
-              <div>
-                <h4 style="margin: 0 0 0.25rem; color: #38bdf8; font-size: 1.05rem; display: flex; align-items: center; gap: 0.5rem;">
-                  <span>🔗</span> 1-Click LinkedIn Connect (App: <code>862xwbz3mk9f4n</code>)
-                </h4>
-                <p style="margin: 0; font-size: 0.85rem; color: var(--text-muted);">
-                  Authorize directly in your browser. Tokens are automatically exchanged and saved to Cloudflare D1.
-                </p>
+          <!-- 1-Click Integration Banners -->
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1rem; margin-bottom: 1.25rem;">
+            <!-- LinkedIn 1-Click Banner -->
+            <div style="background: rgba(10, 102, 194, 0.12); border: 1px solid rgba(10, 102, 194, 0.35); border-radius: 10px; padding: 1.25rem;">
+              <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem;">
+                <div>
+                  <h4 style="margin: 0 0 0.25rem; color: #38bdf8; font-size: 1.05rem; display: flex; align-items: center; gap: 0.5rem;">
+                    <span>🔗</span> 1-Click LinkedIn Connect (App: <code>862xwbz3mk9f4n</code>)
+                    <span id="badge-li-secret-status" class="badge-status badge-failed" style="font-size: 0.7rem;">Secret Missing</span>
+                  </h4>
+                  <p style="margin: 0; font-size: 0.82rem; color: var(--text-muted);">
+                    Authorize in browser. Tokens are automatically exchanged and saved to Cloudflare D1.
+                  </p>
+                </div>
+                <a href="/auth/linkedin" class="btn btn-primary btn-sm" style="background: #0a66c2; text-decoration: none;">
+                  🚀 Connect LinkedIn
+                </a>
               </div>
-              <a href="/auth/linkedin" class="btn btn-primary" style="background: #0a66c2; text-decoration: none; padding: 0.6rem 1.2rem;">
-                🚀 Connect LinkedIn with 1-Click
-              </a>
+              <div style="margin-top: 0.65rem; font-size: 0.75rem; color: var(--text-muted); border-top: 1px dashed rgba(56, 189, 248, 0.2); padding-top: 0.4rem;">
+                📌 <strong>App Products Required:</strong> "Share on LinkedIn" &amp; "Sign In with LinkedIn using OpenID Connect"<br>
+                OAuth Redirect: <code style="color: var(--accent); background: #06090e; padding: 0.1rem 0.3rem; border-radius: 4px;">https://mcp.sohag.com.bd/auth/linkedin/callback</code>
+              </div>
             </div>
-            <div style="margin-top: 0.75rem; font-size: 0.75rem; color: var(--text-muted); border-top: 1px dashed rgba(56, 189, 248, 0.2); padding-top: 0.5rem;">
-              ⚠️ <strong>Required:</strong> In your LinkedIn Developer App (<code>862xwbz3mk9f4n</code>), go to <strong>Auth</strong> &rarr; <strong>OAuth 2.0 settings</strong> &rarr; add Redirect URL:
-              <code style="color: var(--accent); background: #06090e; padding: 0.15rem 0.4rem; border-radius: 4px;">https://mcp.sohag.com.bd/auth/linkedin/callback</code>
+
+            <!-- GitHub Integration Banner -->
+            <div style="background: rgba(147, 51, 234, 0.12); border: 1px solid rgba(147, 51, 234, 0.35); border-radius: 10px; padding: 1.25rem;">
+              <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem;">
+                <div>
+                  <h4 style="margin: 0 0 0.25rem; color: #c084fc; font-size: 1.05rem; display: flex; align-items: center; gap: 0.5rem;">
+                    <span>🐙</span> GitHub Integration (Issues, Gists, Repos)
+                  </h4>
+                  <p style="margin: 0; font-size: 0.82rem; color: var(--text-muted);">
+                    Connect GitHub with a PAT or OAuth so AI agents can manage code and repositories.
+                  </p>
+                </div>
+                <button class="btn btn-primary btn-sm" onclick="connectPlatform('github')" style="background: #7e22ce;">
+                  ➕ Set GitHub Token
+                </button>
+              </div>
+              <div style="margin-top: 0.65rem; font-size: 0.72rem; color: var(--text-muted); border-top: 1px dashed rgba(192, 132, 252, 0.2); padding-top: 0.4rem;">
+                Scopes needed: <code>repo</code>, <code>gist</code>, <code>read:user</code> &bull; <a href="/auth/github" style="color: #c084fc; text-decoration: underline;">1-Click OAuth (if configured)</a>
+              </div>
             </div>
+          </div>
+
+          <!-- OAuth Developer App Config (Save Secret to D1 without terminal) -->
+          <div style="background: rgba(14, 21, 36, 0.95); border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 10px; padding: 1.25rem; margin-bottom: 1.5rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; flex-wrap: wrap; gap: 0.5rem;">
+              <h4 style="margin: 0; color: #38bdf8; font-size: 1rem; display: flex; align-items: center; gap: 0.4rem;">
+                <span>🔐</span> 1-Click OAuth App Configuration (Client ID &amp; Secret)
+              </h4>
+              <span style="font-size: 0.78rem; color: var(--accent);">Directly saves to D1 &mdash; no terminal commands required!</span>
+            </div>
+            <p style="font-size: 0.82rem; color: var(--text-muted); margin-bottom: 1rem;">
+              Paste your LinkedIn or GitHub <strong>Primary Client Secret</strong> here and save to Cloudflare D1 so 1-Click browser connection works automatically.
+            </p>
+            <form onsubmit="handleOAuthAppSubmit(event)" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 0.85rem; align-items: flex-end;">
+              <div class="form-group" style="margin-bottom: 0;">
+                <label style="font-size: 0.78rem; color: var(--text-muted); display: block; margin-bottom: 0.25rem;">Platform</label>
+                <select id="oauth-app-platform" class="form-control" onchange="onOAuthAppPlatformChange()" style="background: #131c2e; color: white;">
+                  <option value="linkedin">LinkedIn</option>
+                  <option value="github">GitHub</option>
+                </select>
+              </div>
+              <div class="form-group" style="margin-bottom: 0;">
+                <label style="font-size: 0.78rem; color: var(--text-muted); display: block; margin-bottom: 0.25rem;">Client ID</label>
+                <input type="text" id="oauth-app-client-id" class="form-control" value="862xwbz3mk9f4n" required>
+              </div>
+              <div class="form-group" style="margin-bottom: 0;">
+                <label style="font-size: 0.78rem; color: var(--text-muted); display: block; margin-bottom: 0.25rem;">Primary Client Secret</label>
+                <input type="password" id="oauth-app-client-secret" class="form-control" placeholder="Paste Primary Client Secret here..." required>
+              </div>
+              <div style="display: flex; gap: 0.5rem;">
+                <button type="button" id="btn-test-oauth-app" class="btn btn-outline btn-sm" onclick="testOAuthAppSecret()" style="flex: 1; justify-content: center; height: 36px; color: var(--green); border-color: var(--green);" title="Verify Client Secret with provider before saving">
+                  🧪 Test Secret
+                </button>
+                <button type="submit" id="btn-save-oauth-app" class="btn btn-primary btn-sm" style="flex: 1; justify-content: center; height: 36px;">
+                  💾 Save to D1
+                </button>
+              </div>
+            </form>
+            <div id="oauth-app-status-msg" style="font-size: 0.82rem; margin-top: 0.6rem; display: none;"></div>
           </div>
 
           <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1.5rem; margin-top: 0.5rem;">
             <!-- Current Status Table -->
             <div>
-              <h3 style="font-size: 1rem; color: var(--blue); margin-bottom: 0.75rem;">Connected Accounts</h3>
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; flex-wrap: wrap; gap: 0.5rem;">
+                <h3 style="font-size: 1rem; color: var(--blue); margin: 0;">Connected Accounts & Links</h3>
+                <div style="display: flex; gap: 0.5rem; align-items: center;">
+                  <button type="button" class="btn btn-outline btn-sm" onclick="testAllConnections()" style="color: var(--green); border-color: var(--green); padding: 0.25rem 0.6rem; font-size: 0.75rem;" title="Test all connected providers">
+                    🧪 Test All Providers
+                  </button>
+                  <span style="font-size: 0.75rem; color: var(--text-muted);">Click 🗑️ to remove</span>
+                </div>
+              </div>
               <div class="table-container">
                 <table>
                   <thead>
                     <tr>
                       <th>Platform</th>
+                      <th>Account / Details</th>
                       <th>Token Type</th>
                       <th>Last Updated</th>
                       <th>Status</th>
+                      <th>Action</th>
                     </tr>
                   </thead>
                   <tbody id="credentials-table-body">
-                    <tr><td colspan="4" style="text-align: center; color: var(--text-muted);">Loading credentials...</td></tr>
+                    <tr><td colspan="6" style="text-align: center; color: var(--text-muted);">Loading credentials...</td></tr>
                   </tbody>
                 </table>
               </div>
@@ -873,35 +1631,47 @@ function renderDashboard(origin: string, cf: any, env: Env): string {
 
             <!-- Credentials Setup Form -->
             <div style="background: #090e18; border: 1px solid var(--border); border-radius: 10px; padding: 1.25rem;">
-              <h3 style="font-size: 1rem; color: var(--accent); margin-bottom: 0.5rem;">⚙️ Set / Update API Credentials</h3>
+              <h3 style="font-size: 1rem; color: var(--accent); margin-bottom: 0.5rem;">⚙️ Add / Update Social & Developer Links</h3>
               <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem;">
-                Store your OAuth access tokens in Cloudflare D1 so Muse AI can automatically publish.
+                Save tokens directly to Cloudflare D1 so AI agents (Muse AI, Cursor) can automate actions.
               </p>
               <form onsubmit="handleCredentialSubmit(event)">
                 <div class="form-group" style="margin-bottom: 0.85rem;">
                   <label style="font-size: 0.8rem; color: var(--text-muted); display: block; margin-bottom: 0.3rem;">Target Platform</label>
-                  <select id="cred-platform" class="form-control" style="background: #131c2e; color: white;" required>
-                    <option value="linkedin">LinkedIn</option>
-                    <option value="youtube">YouTube (Google OAuth)</option>
-                    <option value="facebook">Facebook / Meta</option>
+                  <select id="cred-platform" class="form-control" style="background: #131c2e; color: white;" onchange="onPlatformSelectChange()" required>
+                    <option value="github">🐙 GitHub (Personal Access Token / OAuth)</option>
+                    <option value="linkedin">🔗 LinkedIn</option>
+                    <option value="youtube">▶️ YouTube (Google OAuth)</option>
+                    <option value="facebook">📘 Facebook / Meta</option>
+                    <option value="x">🐦 X / Twitter</option>
+                    <option value="custom">✨ Custom Platform...</option>
                   </select>
                 </div>
+                <div id="custom-platform-container" class="form-group" style="display: none; margin-bottom: 0.85rem;">
+                  <label style="font-size: 0.8rem; color: var(--accent); display: block; margin-bottom: 0.3rem;">Custom Platform Name</label>
+                  <input type="text" id="cred-custom-platform" class="form-control" placeholder="e.g. discord, slack, telegram">
+                </div>
                 <div class="form-group" style="margin-bottom: 0.85rem;">
-                  <label style="font-size: 0.8rem; color: var(--text-muted); display: block; margin-bottom: 0.3rem;">Access Token (OAuth Bearer)</label>
-                  <input type="password" id="cred-token" class="form-control" placeholder="Paste access_token here..." required>
+                  <label style="font-size: 0.8rem; color: var(--text-muted); display: block; margin-bottom: 0.3rem;">Access Token / API Key</label>
+                  <input type="password" id="cred-token" class="form-control" placeholder="Paste GitHub PAT (ghp_...) or Bearer token..." required>
                 </div>
                 <div class="form-group" style="margin-bottom: 0.85rem;">
                   <label style="font-size: 0.8rem; color: var(--text-muted); display: block; margin-bottom: 0.3rem;">Refresh Token (Optional)</label>
                   <input type="password" id="cred-refresh" class="form-control" placeholder="Optional refresh_token">
                 </div>
                 <div class="form-group" style="margin-bottom: 1rem;">
-                  <label style="font-size: 0.8rem; color: var(--text-muted); display: block; margin-bottom: 0.3rem;">Extra Metadata (Optional JSON e.g. Channel ID / URN)</label>
-                  <input type="text" id="cred-extra" class="form-control" placeholder='{"channel_id": "UC..."}'>
+                  <label style="font-size: 0.8rem; color: var(--text-muted); display: block; margin-bottom: 0.3rem;">Extra Metadata (Optional JSON e.g. Username / Channel ID)</label>
+                  <input type="text" id="cred-extra" class="form-control" placeholder='Optional (auto-detects GitHub profile)'>
                 </div>
                 <div id="cred-status-msg" style="font-size: 0.85rem; margin-bottom: 0.85rem; display: none;"></div>
-                <button type="submit" id="btn-save-cred" class="btn btn-primary btn-sm" style="width: 100%; justify-content: center;">
-                  💾 Save Credentials to Cloudflare D1
-                </button>
+                <div style="display: flex; gap: 0.5rem;">
+                  <button type="button" id="btn-test-cred" class="btn btn-outline btn-sm" onclick="testDirectTokenForm()" style="flex: 1; justify-content: center; color: var(--green); border-color: var(--green); height: 36px;" title="Test API key before saving">
+                    🧪 Test Token First
+                  </button>
+                  <button type="submit" id="btn-save-cred" class="btn btn-primary btn-sm" style="flex: 1; justify-content: center; height: 36px;">
+                    💾 Save to D1
+                  </button>
+                </div>
               </form>
             </div>
           </div>
@@ -909,8 +1679,9 @@ function renderDashboard(origin: string, cf: any, env: Env): string {
           <!-- Quick Help Card -->
           <div style="background: rgba(56, 189, 248, 0.05); border: 1px solid rgba(56, 189, 248, 0.2); border-radius: 8px; padding: 1rem; margin-top: 1.25rem; font-size: 0.85rem;">
             <strong style="color: var(--blue);">💡 Where to get your API Tokens:</strong>
-            <ul style="margin-top: 0.5rem; padding-left: 1.2rem; color: var(--text-muted);">
-              <li><strong>LinkedIn:</strong> Go to <a href="https://www.linkedin.com/developers/" target="_blank" style="color: var(--blue);">LinkedIn Developer Portal</a> &rarr; Create App &rarr; Add <em>Share on LinkedIn</em> product &rarr; Generate OAuth 2.0 User Token with scope <code>w_member_social</code>.</li>
+            <ul style="margin-top: 0.5rem; padding-left: 1.2rem; color: var(--text-muted); line-height: 1.7;">
+              <li><strong>GitHub:</strong> Go to <a href="https://github.com/settings/tokens" target="_blank" style="color: var(--blue);">GitHub Settings &rarr; Developer settings &rarr; Personal access tokens</a> &rarr; Generate new token (classic) with <code>repo</code>, <code>gist</code>, and <code>read:user</code> scopes. Paste token above (starts with <code>ghp_</code>).</li>
+              <li><strong>LinkedIn:</strong> Go to <a href="https://www.linkedin.com/developers/" target="_blank" style="color: var(--blue);">LinkedIn Developer Portal</a> &rarr; Create App &rarr; Add <em>Share on LinkedIn</em> product &rarr; Generate OAuth 2.0 User Token with scope <code>w_member_social</code>, or click <em>Connect LinkedIn</em> above.</li>
               <li><strong>YouTube:</strong> Go to <a href="https://console.cloud.google.com/" target="_blank" style="color: var(--blue);">Google Cloud Console</a> &rarr; Enable <em>YouTube Data API v3</em> &rarr; Create OAuth 2.0 Client &rarr; Generate Access Token via <a href="https://developers.google.com/oauthplayground/" target="_blank" style="color: var(--blue);">Google OAuth Playground</a> (scope: <code>https://www.googleapis.com/auth/youtube.upload</code>).</li>
             </ul>
           </div>
@@ -955,11 +1726,16 @@ function renderDashboard(origin: string, cf: any, env: Env): string {
       <pre><code>Server URL: ${mcpEndpoint}
 Transport: HTTP POST (Streamable HTTP / JSON-RPC 2.0)
 Key Automation Tools:
-- linkedin_publish_post  → Publishes posts/articles to LinkedIn and saves logs in D1
-- youtube_upload_video   → Uploads videos stored in R2 directly to YouTube
-- youtube_reply_comment  → Replies to YouTube comments
-- db_get_post_logs       → Muse AI can check recent post logs and approval status
-- r2_upload_file         → Uploads media assets to https://mcp.sohag.com.bd/media/...</code></pre>
+- github_get_user         → Fetches authenticated GitHub profile and repository stats
+- github_list_repositories→ Lists public & private repositories with sorting and filters
+- github_create_issue     → Opens new issues in GitHub repos and records in D1
+- github_create_gist      → Creates public or secret code Gists and records in D1
+- github_create_or_update_file → Directly commits or updates files in GitHub repositories
+- linkedin_publish_post   → Publishes posts/articles to LinkedIn and saves logs in D1
+- youtube_upload_video    → Uploads videos stored in R2 directly to YouTube
+- youtube_reply_comment   → Replies to YouTube comments
+- db_get_post_logs        → Muse AI can check recent post logs and approval status
+- r2_upload_file          → Uploads media assets to https://mcp.sohag.com.bd/media/...</code></pre>
     </div>
 
     <!-- Tools Catalog -->
@@ -1111,6 +1887,20 @@ Key Automation Tools:
 
         // Render Credentials Table
         renderCredentialsTable(data.credentials || []);
+
+        // Update OAuth Apps status
+        if (data.oauthApps) {
+          const liStatus = document.getElementById("badge-li-secret-status");
+          if (liStatus) {
+            if (data.oauthApps.linkedin.hasSecret) {
+              liStatus.className = "badge-status badge-published";
+              liStatus.textContent = "Secret: Saved in D1 ✅";
+            } else {
+              liStatus.className = "badge-status badge-failed";
+              liStatus.textContent = "Secret: Missing in D1 ⚠️";
+            }
+          }
+        }
       } catch (err) {
         console.error("Error refreshing logs:", err);
       }
@@ -1128,9 +1918,11 @@ Key Automation Tools:
         if (p.status === "published") badgeClass = "badge-published";
         if (p.status === "failed") badgeClass = "badge-failed";
 
-        const mediaLink = p.media_urls
-          ? '<a href="' + p.media_urls + '" target="_blank" style="color: var(--blue);">View Media</a>'
-          : '<span style="color: var(--text-muted);">-</span>';
+        let mediaLink = '<span style="color: var(--text-muted);">-</span>';
+        if (p.media_urls) {
+          const linkText = p.platform === "github" ? "View on GitHub ↗" : "View Media ↗";
+          mediaLink = '<a href="' + p.media_urls + '" target="_blank" style="color: var(--blue);">' + linkText + '</a>';
+        }
 
         const rawResponse = p.response_data ? JSON.stringify(JSON.parse(p.response_data), null, 2) : "None";
         const contentSnippet = (p.content || "").length > 80 ? (p.content.substring(0, 80) + "...") : p.content;
@@ -1187,22 +1979,144 @@ Key Automation Tools:
 
     function renderCredentialsTable(creds) {
       const tbody = document.getElementById("credentials-table-body");
-      const platforms = ["linkedin", "youtube", "facebook"];
-      tbody.innerHTML = platforms.map(plat => {
+      
+      const known = {
+        github: { name: "GitHub", icon: "🐙" },
+        linkedin: { name: "LinkedIn", icon: "🔗" },
+        youtube: { name: "YouTube", icon: "▶️" },
+        facebook: { name: "Facebook", icon: "📘" },
+        x: { name: "X (Twitter)", icon: "🐦" },
+      };
+
+      const defaultList = ["github", "linkedin", "youtube", "facebook"];
+      const configuredPlatforms = creds.map(c => c.platform);
+      const allPlatforms = Array.from(new Set([...defaultList, ...configuredPlatforms]));
+
+      tbody.innerHTML = allPlatforms.map(plat => {
         const item = creds.find(c => c.platform === plat);
         const configured = !!item;
+        const meta = known[plat] || { name: plat.charAt(0).toUpperCase() + plat.slice(1), icon: "🌐" };
+
+        let detailsHtml = '<span style="color: var(--text-muted);">-</span>';
+        if (configured && item.extra_data) {
+          try {
+            const extra = typeof item.extra_data === "string" ? JSON.parse(item.extra_data) : item.extra_data;
+            if (extra.login) {
+              detailsHtml = '<a href="' + (extra.html_url || ('https://github.com/' + extra.login)) + '" target="_blank" style="color: var(--blue); font-weight: 600;">@' + escapeHtml(extra.login) + '</a>';
+            } else if (extra.name) {
+              detailsHtml = '<span style="color: var(--text);">' + escapeHtml(extra.name) + '</span>';
+            } else if (extra.channel_id) {
+              detailsHtml = '<code style="font-size: 0.75rem;">' + escapeHtml(extra.channel_id) + '</code>';
+            } else if (extra.author_urn) {
+              detailsHtml = '<code style="font-size: 0.75rem;">' + escapeHtml(extra.author_urn) + '</code>';
+            }
+          } catch {}
+        }
+
+        const actionHtml = configured
+          ? '<div style="display: flex; gap: 0.35rem; align-items: center;">' +
+            '<button class="btn btn-outline btn-sm" onclick="testConnection(\\'' + plat + '\\')" style="color: var(--green); border-color: var(--green); padding: 0.2rem 0.55rem; font-size: 0.78rem;" title="Test ' + plat + ' Connection">🧪 Test</button>' +
+            '<button class="btn btn-danger btn-sm" onclick="deleteCredential(\\'' + plat + '\\')" style="padding: 0.2rem 0.5rem; font-size: 0.78rem;" title="Delete ' + plat + ' credentials">🗑️</button>' +
+            '</div>'
+          : '<div style="display: flex; gap: 0.35rem; align-items: center;">' +
+            '<button class="btn btn-outline btn-sm" onclick="connectPlatform(\\'' + plat + '\\')" style="color: var(--blue); border-color: var(--blue); padding: 0.2rem 0.55rem; font-size: 0.78rem;" title="Connect ' + plat + '">➕ Connect</button>' +
+            '</div>';
+
         return '<tr>' +
-          '<td><strong style="text-transform: capitalize; color: var(--accent);">' + plat + '</strong></td>' +
+          '<td><strong>' + meta.icon + ' ' + meta.name + '</strong></td>' +
+          '<td>' + detailsHtml + '</td>' +
           '<td>' + (configured ? (item.token_type || "Bearer") : "-") + '</td>' +
           '<td style="font-size: 0.8rem; color: var(--text-muted);">' + (configured && item.updated_at ? item.updated_at : "Never") + '</td>' +
           '<td><span class="badge-status ' + (configured ? "badge-published" : "badge-failed") + '">' + (configured ? "Connected" : "Not Configured") + '</span></td>' +
+          '<td>' + actionHtml + '</td>' +
         '</tr>';
       }).join("");
     }
 
+    async function deleteCredential(platform) {
+      if (!confirm("Are you sure you want to delete credentials for " + platform.toUpperCase() + " from Cloudflare D1? AI agents will no longer be able to authenticate on this platform.")) {
+        return;
+      }
+      try {
+        const res = await fetch("/api/admin/credentials?platform=" + encodeURIComponent(platform), {
+          method: "DELETE"
+        });
+        const data = await res.json();
+        if (data.success) {
+          alert("✅ " + (data.message || "Credential deleted successfully"));
+          await refreshAdminLogs();
+        } else {
+          alert("❌ Failed to delete: " + (data.error || "Unknown error"));
+        }
+      } catch (err) {
+        alert("❌ Network error while deleting credential");
+      }
+    }
+
+    function connectPlatform(platform) {
+      const select = document.getElementById("cred-platform");
+      const customContainer = document.getElementById("custom-platform-container");
+      const customInput = document.getElementById("cred-custom-platform");
+      let found = false;
+      for (let i = 0; i < select.options.length; i++) {
+        if (select.options[i].value === platform) {
+          select.selectedIndex = i;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        select.value = "custom";
+        customContainer.style.display = "block";
+        customInput.value = platform;
+      } else {
+        customContainer.style.display = "none";
+      }
+      onPlatformSelectChange();
+      const tokenInput = document.getElementById("cred-token");
+      tokenInput.focus();
+      tokenInput.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+
+    function onPlatformSelectChange() {
+      const select = document.getElementById("cred-platform");
+      const customContainer = document.getElementById("custom-platform-container");
+      const tokenInput = document.getElementById("cred-token");
+      const extraInput = document.getElementById("cred-extra");
+
+      if (select.value === "custom") {
+        customContainer.style.display = "block";
+        document.getElementById("cred-custom-platform").focus();
+      } else {
+        customContainer.style.display = "none";
+      }
+
+      if (select.value === "github") {
+        tokenInput.placeholder = "Paste GitHub PAT (e.g. ghp_... or github_pat_...)";
+        extraInput.placeholder = "Optional (auto-detects GitHub username if left empty)";
+      } else if (select.value === "linkedin") {
+        tokenInput.placeholder = "Paste LinkedIn OAuth Access Token...";
+        extraInput.placeholder = '{"author_urn": "urn:li:person:..."}';
+      } else if (select.value === "youtube") {
+        tokenInput.placeholder = "Paste Google / YouTube OAuth Access Token...";
+        extraInput.placeholder = '{"channel_id": "UC..."}';
+      } else {
+        tokenInput.placeholder = "Paste access_token or API key here...";
+        extraInput.placeholder = "Optional JSON metadata";
+      }
+    }
+
     async function handleCredentialSubmit(e) {
       e.preventDefault();
-      const platform = document.getElementById("cred-platform").value;
+      const selectVal = document.getElementById("cred-platform").value;
+      const customVal = document.getElementById("cred-custom-platform").value.trim().toLowerCase();
+      const platform = (selectVal === "custom" ? customVal : selectVal).trim().toLowerCase();
+
+      if (!platform) {
+        alert("Please enter a valid platform name");
+        return;
+      }
+
       const accessToken = document.getElementById("cred-token").value.trim();
       const refreshToken = document.getElementById("cred-refresh").value.trim();
       const extraData = document.getElementById("cred-extra").value.trim();
@@ -1232,6 +2146,9 @@ Key Automation Tools:
           document.getElementById("cred-token").value = "";
           document.getElementById("cred-refresh").value = "";
           document.getElementById("cred-extra").value = "";
+          if (selectVal === "custom") {
+            document.getElementById("cred-custom-platform").value = "";
+          }
           await refreshAdminLogs();
         } else {
           msgDiv.style.color = "var(--red)";
@@ -1245,6 +2162,222 @@ Key Automation Tools:
       } finally {
         btn.disabled = false;
         btn.textContent = "💾 Save Credentials to Cloudflare D1";
+      }
+    }
+
+    function onOAuthAppPlatformChange() {
+      const plat = document.getElementById("oauth-app-platform").value;
+      const clientIdInput = document.getElementById("oauth-app-client-id");
+      const secretInput = document.getElementById("oauth-app-client-secret");
+      if (plat === "linkedin") {
+        clientIdInput.value = "862xwbz3mk9f4n";
+        secretInput.placeholder = "Paste LinkedIn Client Secret (WPL_AP1...)";
+      } else {
+        clientIdInput.value = "";
+        secretInput.placeholder = "Paste GitHub Client Secret";
+      }
+    }
+
+    async function handleOAuthAppSubmit(e) {
+      e.preventDefault();
+      const platform = document.getElementById("oauth-app-platform").value;
+      const clientId = document.getElementById("oauth-app-client-id").value.trim();
+      const clientSecret = document.getElementById("oauth-app-client-secret").value.trim();
+      const msgDiv = document.getElementById("oauth-app-status-msg");
+      const btn = document.getElementById("btn-save-oauth-app");
+
+      btn.disabled = true;
+      btn.textContent = "Saving to D1...";
+      msgDiv.style.display = "none";
+
+      try {
+        const res = await fetch("/api/admin/oauth-app", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            platform,
+            client_id: clientId,
+            client_secret: clientSecret
+          })
+        });
+        const data = await res.json();
+        if (data.success) {
+          msgDiv.style.color = "var(--green)";
+          msgDiv.textContent = "✅ " + data.message;
+          msgDiv.style.display = "block";
+          document.getElementById("oauth-app-client-secret").value = "";
+          await refreshAdminLogs();
+        } else {
+          msgDiv.style.color = "var(--red)";
+          msgDiv.textContent = "❌ " + (data.error || "Failed to save");
+          msgDiv.style.display = "block";
+        }
+      } catch (err) {
+        msgDiv.style.color = "var(--red)";
+        msgDiv.textContent = "❌ Network error";
+        msgDiv.style.display = "block";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "💾 Save Secret to D1";
+      }
+    }
+
+    async function testOAuthAppSecret() {
+      const platform = document.getElementById("oauth-app-platform").value;
+      const clientId = document.getElementById("oauth-app-client-id").value.trim();
+      const clientSecret = document.getElementById("oauth-app-client-secret").value.trim();
+      const msgDiv = document.getElementById("oauth-app-status-msg");
+      const btn = document.getElementById("btn-test-oauth-app");
+
+      btn.disabled = true;
+      btn.textContent = "Testing...";
+      msgDiv.style.display = "block";
+      msgDiv.style.color = "var(--yellow)";
+      msgDiv.textContent = "⏳ Verifying " + platform + " credentials with provider API...";
+
+      try {
+        const res = await fetch("/api/admin/test-oauth-app", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            platform,
+            client_id: clientId,
+            client_secret: clientSecret
+          })
+        });
+        const data = await res.json();
+        if (data.success) {
+          msgDiv.style.color = "var(--green)";
+          msgDiv.innerHTML = "<strong>" + data.message + "</strong> Now click <strong>💾 Save to D1</strong>!";
+        } else {
+          msgDiv.style.color = "var(--red)";
+          msgDiv.innerHTML = "<strong>❌ Verification Failed:</strong> " + (data.error || "Secret rejected by provider");
+        }
+      } catch (err) {
+        msgDiv.style.color = "var(--red)";
+        msgDiv.textContent = "❌ Network error testing secret: " + err.message;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "🧪 Test Secret";
+      }
+    }
+
+    async function testConnection(platform) {
+      const btn = event && event.target && event.target.tagName === "BUTTON" ? event.target : null;
+      const originalText = btn ? btn.textContent : "";
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Testing...";
+      }
+
+      try {
+        const res = await fetch("/api/admin/test-connection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ platform })
+        });
+        const data = await res.json();
+        if (data.success) {
+          alert("✅ [" + platform.toUpperCase() + " Connection Healthy]\n\n" + data.message);
+          await refreshAdminLogs();
+        } else {
+          alert("❌ [" + platform.toUpperCase() + " Connection Error]\n\n" + (data.error || "Verification failed. Token may be expired or invalid."));
+        }
+      } catch (err) {
+        alert("❌ Network error testing " + platform + ": " + err.message);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = originalText || "🧪 Test";
+        }
+      }
+    }
+
+    async function testAllConnections() {
+      const btn = event && event.target && event.target.tagName === "BUTTON" ? event.target : null;
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "⏳ Testing all...";
+      }
+
+      try {
+        const res = await fetch("/api/admin/logs");
+        const logsData = await res.json();
+        const creds = (logsData.credentials || []).filter(c => !c.platform.endsWith("_oauth_app"));
+        if (creds.length === 0) {
+          alert("No connected providers found in D1! Connect a platform or save an API token first.");
+          return;
+        }
+
+        let summary = "🧪 Live Connection Test Results (" + creds.length + " Providers):\n\n";
+        for (const c of creds) {
+          try {
+            const testRes = await fetch("/api/admin/test-connection", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ platform: c.platform })
+            });
+            const result = await testRes.json();
+            if (result.success) {
+              summary += "• " + c.platform.toUpperCase() + ": " + result.message + "\n\n";
+            } else {
+              summary += "• " + c.platform.toUpperCase() + ": ❌ " + result.error + "\n\n";
+            }
+          } catch (err) {
+            summary += "• " + c.platform.toUpperCase() + ": ❌ " + err.message + "\n\n";
+          }
+        }
+        alert(summary);
+      } catch (err) {
+        alert("Error testing providers: " + err.message);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = "🧪 Test All Providers";
+        }
+      }
+    }
+
+    async function testDirectTokenForm() {
+      const selectVal = document.getElementById("cred-platform").value;
+      const customVal = document.getElementById("cred-custom-platform").value.trim().toLowerCase();
+      const platform = (selectVal === "custom" ? customVal : selectVal).trim().toLowerCase();
+      const accessToken = document.getElementById("cred-token").value.trim();
+      const msgDiv = document.getElementById("cred-status-msg");
+      const btn = document.getElementById("btn-test-cred");
+
+      if (!accessToken) {
+        alert("Please paste an Access Token / API Key to test first!");
+        document.getElementById("cred-token").focus();
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = "Testing...";
+      msgDiv.style.display = "block";
+      msgDiv.style.color = "var(--yellow)";
+      msgDiv.textContent = "⏳ Testing token with " + platform + "...";
+
+      try {
+        const res = await fetch("/api/admin/test-connection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ platform, access_token: accessToken })
+        });
+        const data = await res.json();
+        if (data.success) {
+          msgDiv.style.color = "var(--green)";
+          msgDiv.innerHTML = "<strong>" + data.message + "</strong> (Token is working! Ready to save to D1)";
+        } else {
+          msgDiv.style.color = "var(--red)";
+          msgDiv.innerHTML = "<strong>❌ Token Test Failed:</strong> " + (data.error || "Invalid token");
+        }
+      } catch (err) {
+        msgDiv.style.color = "var(--red)";
+        msgDiv.textContent = "❌ Network error testing token: " + err.message;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "🧪 Test Token First";
       }
     }
 

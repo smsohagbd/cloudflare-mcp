@@ -20,22 +20,29 @@ External agents like **Muse AI** connect to this MCP server to plan and automate
 * **AI Binding**: `env.AI` (Cloudflare Workers AI)
 
 ## Available MCP Tools Summary
-1. **Social Automation**:
+1. **GitHub Developer Automation**:
+   - `github_get_user`: Fetch authenticated user profile or any specified username.
+   - `github_list_repositories`: List public & private repos with sorting and limit.
+   - `github_get_repository`: Get repository details (stars, forks, open issues, language).
+   - `github_create_issue`: Open an issue in a GitHub repository and log to D1.
+   - `github_create_gist`: Create a code Gist (public or secret) and log to D1.
+   - `github_create_or_update_file`: Commit and push file changes directly to a repository.
+2. **Social Automation**:
    - `linkedin_publish_post`: Publish post/article with media to LinkedIn. Automatically logs to D1.
    - `linkedin_get_profile`: Query authenticated member profile.
    - `youtube_upload_video`: Resumable upload of video from R2 URL to YouTube. Automatically logs to D1.
    - `youtube_get_channel_stats`: Query subscriber, view, and video analytics.
    - `youtube_list_comments`: List comments and replies on any video.
    - `youtube_reply_comment`: Post replies to comments and log to D1.
-2. **Database & Storage**:
+3. **Database & Storage**:
    - `db_save_post_log`: Save post log in D1 `post_logs`.
    - `db_get_post_logs`: Filter and read post logs from D1.
    - `db_save_comment_log`: Record received comments / replies in D1 `comments_log`.
    - `db_get_comment_logs`: Query comment logs from D1.
    - `r2_upload_file`: Upload base64 media to R2, get immediate `https://mcp.sohag.com.bd/media/...` URL.
    - `r2_list_files`: List objects stored in R2.
-   - `manage_social_credentials`: Store and retrieve OAuth tokens in D1 securely.
-3. **Edge Utilities**:
+   - `manage_social_credentials`: Store, retrieve, delete, or list OAuth tokens in D1 securely.
+4. **Edge Utilities**:
    - `dns_lookup`: Cloudflare 1.1.1.1 DoH resolution.
    - `fetch_web_content`: Strip HTML and extract clean readable text.
    - `ip_lookup`: Edge geolocation, ASN, and network info.
@@ -46,12 +53,13 @@ External agents like **Muse AI** connect to this MCP server to plan and automate
    - `ask_ai`: Run serverless LLMs (Llama 3.1) directly on edge.
 
 ## File Organization
-* `src/index.ts`: Routing (`/mcp`, `/sse`, `/media/*`, `/health`, `/`)
+* `src/index.ts`: Routing (`/mcp`, `/sse`, `/media/*`, `/health`, `/api/admin/*`, `/auth/*`, `/`)
 * `src/mcp/handler.ts`: Protocol processor for JSON-RPC 2.0
 * `src/tools/index.ts`: Tool aggregator and router
 * `src/tools/general.ts`: Edge utilities
-* `src/tools/storage.ts`: D1 and R2 operations
+* `src/tools/storage.ts`: D1 and R2 operations, credential management
 * `src/tools/social.ts`: LinkedIn and YouTube API calls
+* `src/tools/github.ts`: GitHub developer automation tools
 * `schema.sql`: D1 database schema
 * `wrangler.jsonc`: Cloudflare configuration
 

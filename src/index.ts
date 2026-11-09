@@ -959,44 +959,25 @@ export default {
       }
 
       if (platform === "linkedin") {
-        try {
-          const testRes = await fetch("https://www.linkedin.com/oauth/v2/accessToken", {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: new URLSearchParams({
-              grant_type: "client_credentials",
-              client_id: clientId,
-              client_secret: clientSecret,
-            }).toString(),
-          });
-          const text = await testRes.text();
-          let json: any = {};
-          try { json = JSON.parse(text); } catch {}
-
-          if (json.error === "invalid_client") {
-            return new Response(
-              JSON.stringify({
-                success: false,
-                error: `LinkedIn rejected this secret: "invalid_client - Client authentication failed". The secret does not match Client ID ${clientId}. Please copy the Primary Client Secret from your LinkedIn Developer App.`,
-              }),
-              { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
-            );
-          }
-
-          // If unauthorized_client or 200 OK, the client authentication SUCCEEDED
+        // Note: LinkedIn does NOT allow 2-legged client_credentials for standard developer apps (it always returns invalid_client).
+        // Verification is based on secret format and then completed during the 3-legged authorization code flow.
+        if (clientSecret.length < 12) {
           return new Response(
             JSON.stringify({
-              success: true,
-              message: `✅ LinkedIn Client ID and Secret are verified and valid!`,
+              success: false,
+              error: `LinkedIn Primary Client Secret is too short. Please copy the complete Primary Client Secret from LinkedIn Developer Portal -> Auth tab (usually starts with "WPL_AP1.").`,
             }),
             { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
           );
-        } catch (err: any) {
-          return new Response(
-            JSON.stringify({ success: false, error: "Network error testing with LinkedIn: " + err.message }),
-            { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
-          );
         }
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            message: `✅ LinkedIn Primary Client Secret format is valid! Now click "Save Secret to D1", then click "Connect LinkedIn" to authorize.`,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+        );
       }
 
       if (platform === "github") {
